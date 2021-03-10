@@ -1198,7 +1198,7 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
       break;
     case binary_log::GTID_LOG_EVENT:
     case binary_log::ANONYMOUS_GTID_LOG_EVENT:
-      ev = NULL;
+      ev= NULL;
       break;
     case binary_log::PREVIOUS_GTIDS_LOG_EVENT:
       ev = NULL;

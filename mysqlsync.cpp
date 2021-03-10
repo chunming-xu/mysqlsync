@@ -187,7 +187,8 @@ int process_event(const char* buf, uint event_len)
     ev= Log_event::read_log_event(buf, event_len, &szErrorMsg, &format_ev, 1);
     if (ev)
     {
-         char *szSQLString = NULL;
+         char szSQLString[10240];
+         memset(szSQLString,0,sizeof(szSQLString));
          switch (ev->get_type_code())
          {
            case QUERY_EVENT:

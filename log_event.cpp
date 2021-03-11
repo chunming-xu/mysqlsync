@@ -1206,7 +1206,7 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
 #if defined(HAVE_REPLICATION)
     case binary_log::WRITE_ROWS_EVENT:
       ev = new Write_rows_log_event(buf, event_len, description_event);
-      break;
+      break;     
     case binary_log::UPDATE_ROWS_EVENT:
       ev = new Update_rows_log_event(buf, event_len, description_event);
       break;

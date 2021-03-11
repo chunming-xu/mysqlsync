@@ -185,8 +185,8 @@ int process_event(const char* buf, uint event_len)
     const Format_description_log_event format_ev = Format_description_log_event(4,0);
 
     ev= Log_event::read_log_event(buf, event_len, &szErrorMsg, &format_ev, 1);
-    if (ev)
-    {
+    //if (ev)
+    //{
          char szSQLString[10240];
          memset(szSQLString,0,sizeof(szSQLString));
          switch (ev->get_type_code())
@@ -196,7 +196,9 @@ int process_event(const char* buf, uint event_len)
                strcpy(szSQLString, ( static_cast< Query_log_event* >( ev ) ) -> query);	
                printf("szSQLString=%s\n",szSQLString);
                break;
+          case PRE_GA_WRITE_ROWS_EVENT:
           case WRITE_ROWS_EVENT:
+          case WRITE_ROWS_EVENT_V1:
                printf("write event \n");
                break;
           case ROWS_QUERY_LOG_EVENT:
@@ -206,7 +208,7 @@ int process_event(const char* buf, uint event_len)
            default:
                printf("default\n");
          }
-    }
+    //}
     
     return 0;
 }

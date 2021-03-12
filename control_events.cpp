@@ -40,24 +40,30 @@ inline char *strndup (const char *s, size_t n)
 }
 uint32_t inline le32toh(uint32_t x)
 {
+  /*
     return (((x >> 24) & 0xff) |
             ((x <<  8) & 0xff0000) |
             ((x >>  8) & 0xff00) |
             ((x << 24) & 0xff000000));
+            */
+           return x;
 }
 uint64_t inline le64toh(uint64_t x)
 {
-
+    /*
     x = ((x << 8) & 0xff00ff00ff00ff00ULL) |
         ((x >> 8) & 0x00ff00ff00ff00ffULL);
     x = ((x << 16) & 0xffff0000ffff0000ULL) |
         ((x >> 16) & 0x0000ffff0000ffffULL);
     return (x << 32) | (x >> 32);
+    */
+   return x;
 }
 
 uint16_t inline le16toh(uint16_t x)
 {
-    return ((x >> 8) | (x << 8));
+    //return ((x >> 8) | (x << 8));
+    return x;
 }
 inline void * bapi_malloc(size_t size, int flags)
 {
@@ -144,7 +150,7 @@ Format_description_event::Format_description_event(uint8_t binlog_ver,
     memset(server_version, 0, ST_SERVER_VER_LEN);
     strncpy(server_version, server_ver, ST_SERVER_VER_LEN - 1);
     //if (binary_log_debug::debug_pretend_version_50034_in_binlog)
-      strcpy(server_version, "5.0.34");
+      strcpy(server_version, "5.7.26");
     common_header_len= LOG_EVENT_HEADER_LEN;
     number_of_event_types= LOG_EVENT_TYPES;
     /**
@@ -272,7 +278,7 @@ Format_description_event::Format_description_event(uint8_t binlog_ver,
     */
     break;
   }
-  //calc_server_version_split();
+  calc_server_version_split();
 }
 
 /**

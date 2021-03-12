@@ -63,7 +63,8 @@ inline uint16    uint2korr(const char *pT)
 {
   return uint2korr(static_cast<const uchar*>(static_cast<const void*>(pT)));
 }
-
+#define no_bytes_in_map(map) (((map)->n_bits + 7)/8)
+#define no_words_in_map(map) (((map)->n_bits + 31)/32)
 using binary_log::enum_binlog_checksum_alg;
 using binary_log::checksum_crc32;
 using binary_log::Log_event_type;
@@ -1992,4 +1993,566 @@ public:
   size_t get_data_size() { return  ident_len + Binary_log_event::ROTATE_HEADER_LEN;}
 
 };
+
+
+/**
+  @class Rows_log_event
+
+ Common base class for all row-containing log events.
+
+ RESPONSIBILITIES
+
+   Encode the common parts of all events containing rows, which are:
+   - Write data header and data body to an IO_CACHE.
+
+  Virtual inheritance is required here to handle the diamond problem in
+  the class Write_rows_log_event, Update_rows_log_event and
+  Delete_rows_log_event.
+  The diamond structure is explained in @Write_rows_log_event,
+                                        @Update_rows_log_event,
+                                        @Delete_rows_log_event
+
+  @internal
+  The inheritance structure in the current design for the classes is
+  as follows:
+
+        Binary_log_event
+               ^
+               |
+               |
+         Rows_event  Log_event
+                \       /
+          <<vir>>\     /
+                  \   /
+              Rows_log_event
+  @endinternal
+
+*/
+class Rows_log_event : public virtual binary_log::Rows_event, public Log_event
+{
+public:
+  typedef uint16 flag_set;
+
+  enum row_lookup_mode {
+       ROW_LOOKUP_UNDEFINED= 0,
+       ROW_LOOKUP_NOT_NEEDED= 1,
+       ROW_LOOKUP_INDEX_SCAN= 2,
+       ROW_LOOKUP_TABLE_SCAN= 3,
+       ROW_LOOKUP_HASH_SCAN= 4
+  };
+
+  /**
+     Enumeration of the errors that can be returned.
+   */
+  enum enum_error
+  {
+    ERR_OPEN_FAILURE = -1,               /**< Failure to open table */
+    ERR_OK = 0,                                 /**< No error */
+    ERR_TABLE_LIMIT_EXCEEDED = 1,      /**< No more room for tables */
+    ERR_OUT_OF_MEM = 2,                         /**< Out of memory */
+    ERR_BAD_TABLE_DEF = 3,     /**< Table definition does not match */
+    ERR_RBR_TO_SBR = 4  /**< daisy-chanining RBR to SBR not allowed */
+  };
+
+
+  /* Special constants representing sets of flags */
+  enum
+  {
+      RLE_NO_FLAGS = 0U
+  };
+
+  virtual ~Rows_log_event();
+
+  void set_flags(flag_set flags_arg) { m_flags |= flags_arg; }
+  void clear_flags(flag_set flags_arg) { m_flags &= ~flags_arg; }
+  flag_set get_flags(flag_set flags_arg) const { return m_flags & flags_arg; }
+
+  virtual Log_event_type get_general_type_code() = 0; /* General rows op type, no version */
+
+#ifdef MYSQL_SERVER
+  int add_row_data(uchar *data, size_t length)
+  {
+    return do_add_row_data(data,length);
+  }
+#endif
+
+  /* Member functions to implement superclass interface */
+  virtual size_t get_data_size();
+
+  MY_BITMAP const *get_cols() const { return &m_cols; }
+  MY_BITMAP const *get_cols_ai() const { return &m_cols_ai; }
+  size_t get_width() const          { return m_width; }
+  const Table_id& get_table_id() const        { return m_table_id; }
+
+#if defined(MYSQL_SERVER)
+  /*
+    This member function compares the table's read/write_set
+    with this event's m_cols and m_cols_ai. Comparison takes
+    into account what type of rows event is this: Delete, Write or
+    Update, therefore it uses the correct m_cols[_ai] according
+    to the event type code.
+
+    Note that this member function should only be called for the
+    following events:
+    - Delete_rows_log_event
+    - Write_rows_log_event
+    - Update_rows_log_event
+
+    @param[IN] table The table to compare this events bitmaps
+                     against.
+
+    @return TRUE if sets match, FALSE otherwise. (following
+                 bitmap_cmp return logic).
+
+   */
+  virtual bool read_write_bitmaps_cmp(TABLE *table)
+  {
+    bool res= FALSE;
+
+    switch (get_general_type_code())
+    {
+      case binary_log::DELETE_ROWS_EVENT:
+        res= bitmap_cmp(get_cols(), table->read_set);
+        break;
+      case binary_log::UPDATE_ROWS_EVENT:
+        res= (bitmap_cmp(get_cols(), table->read_set) &&
+              bitmap_cmp(get_cols_ai(), table->write_set));
+        break;
+      case binary_log::WRITE_ROWS_EVENT:
+        res= bitmap_cmp(get_cols(), table->write_set);
+        break;
+      default:
+        /*
+          We should just compare bitmaps for Delete, Write
+          or Update rows events.
+        */
+        DBUG_ASSERT(0);
+    }
+    return res;
+  }
+#endif
+
+#ifdef MYSQL_SERVER
+  virtual bool write_data_header(IO_CACHE *file);
+  virtual bool write_data_body(IO_CACHE *file);
+  virtual const char *get_db() { return m_table->s->db.str; }
+#endif
+
+  uint     m_row_count;         /* The number of rows added to the event */
+
+  const uchar* get_extra_row_data() const   { return m_extra_row_data; }
+
+protected:
+  /*
+     The constructors are protected since you're supposed to inherit
+     this class, not create instances of this class.
+  */
+#ifdef MYSQL_SERVER
+  Rows_log_event(THD*, TABLE*, const Table_id& table_id,
+		 MY_BITMAP const *cols, bool is_transactional,
+                 Log_event_type event_type,
+                 const uchar* extra_row_info);
+#endif
+  Rows_log_event(const char *row_data, uint event_len,
+		 const Format_description_event *description_event);
+
+#ifdef MYSQL_CLIENT
+  //void print_helper(FILE *, PRINT_EVENT_INFO *, char const *const name);
+#endif
+
+#ifdef MYSQL_SERVER
+  virtual int do_add_row_data(uchar *data, size_t length);
+#endif
+
+#ifdef MYSQL_SERVER
+  TABLE *m_table;		/* The table the rows belong to */
+#endif
+  MY_BITMAP   m_cols;		/* Bitmap denoting columns available */
+#ifndef MYSQL_CLIENT
+  /**
+     Hash table that will hold the entries for while using HASH_SCAN
+     algorithm to search and update/delete rows.
+   */
+  //Hash_slave_rows m_hash;
+
+  /**
+     The algorithm to use while searching for rows using the before
+     image.
+  */
+  uint            m_rows_lookup_algorithm;
+#endif
+  /*
+    Bitmap for columns available in the after image, if present. These
+    fields are only available for Update_rows events. Observe that the
+    width of both the before image COLS vector and the after image
+    COLS vector is the same: the number of columns of the table on the
+    master.
+  */
+  MY_BITMAP   m_cols_ai;
+
+  ulong       m_master_reclength; /* Length of record on master side */
+
+  /* Bit buffers in the same memory as the class */
+  uint32    m_bitbuf[128/(sizeof(uint32)*8)];
+  uint32    m_bitbuf_ai[128/(sizeof(uint32)*8)];
+
+  /*
+   is_valid depends on the value of m_rows_buf, so while changing the value
+   of m_rows_buf check if is_valid also needs to be modified
+  */
+  uchar    *m_rows_buf;		/* The rows in packed format */
+  uchar    *m_rows_cur;		/* One-after the end of the data */
+  uchar    *m_rows_end;		/* One-after the end of the allocated space */
+
+
+  /* helper functions */
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  const uchar *m_curr_row;     /* Start of the row being processed */
+  const uchar *m_curr_row_end; /* One-after the end of the current row */
+  uchar    *m_key;      /* Buffer to keep key value during searches */
+  uint     m_key_index;
+  KEY      *m_key_info; /* Points to description of index #m_key_index */
+  class Key_compare
+  {
+public:
+    /**
+       @param  ki  Where to find KEY description
+       @note m_distinct_keys is instantiated when Rows_log_event is constructed; it
+       stores a Key_compare object internally. However at that moment, the
+       index (KEY*) to use for comparisons, is not yet known. So, at
+       instantiation, we indicate the Key_compare the place where it can
+       find the KEY* when needed (this place is Rows_log_event::m_key_info),
+       Key_compare remembers the place in member m_key_info.
+       Before we need to do comparisons - i.e. before we need to insert
+       elements, we update Rows_log_event::m_key_info once for all.
+    */
+    Key_compare(KEY **ki= NULL) : m_key_info(ki) {}
+    bool operator()(uchar *k1, uchar *k2) const
+    {
+      return key_cmp2((*m_key_info)->key_part,
+                      k1, (*m_key_info)->key_length,
+                      k2, (*m_key_info)->key_length) < 0 ;
+    }
+private:
+    KEY **m_key_info;
+  };
+  std::set<uchar *, Key_compare> m_distinct_keys;
+  std::set<uchar *, Key_compare>::iterator m_itr;
+  /**
+    A spare buffer which will be used when saving the distinct keys
+    for doing an index scan with HASH_SCAN search algorithm.
+  */
+  uchar *m_distinct_key_spare_buf;
+
+  // Unpack the current row into m_table->record[0]
+  int unpack_current_row(const Relay_log_info *const rli,
+                         MY_BITMAP const *cols)
+  {
+    DBUG_ASSERT(m_table);
+
+    ASSERT_OR_RETURN_ERROR(m_curr_row <= m_rows_end, HA_ERR_CORRUPT_EVENT);
+    return ::unpack_row(rli, m_table, m_width, m_curr_row, cols,
+                                   &m_curr_row_end, &m_master_reclength, m_rows_end);
+  }
+
+  /*
+    This member function is called when deciding the algorithm to be used to
+    find the rows to be updated on the slave during row based replication.
+    This this functions sets the m_rows_lookup_algorithm and also the
+    m_key_index with the key index to be used if the algorithm is dependent on
+    an index.
+   */
+  void decide_row_lookup_algorithm_and_key();
+
+  /*
+    Encapsulates the  operations to be done before applying
+    row event for update and delete.
+   */
+  int row_operations_scan_and_key_setup();
+
+  /*
+   Encapsulates the  operations to be done after applying
+   row event for update and delete.
+  */
+  int row_operations_scan_and_key_teardown(int error);
+
+  /**
+    Helper function to check whether there is an auto increment
+    column on the table where the event is to be applied.
+
+    @return true if there is an autoincrement field on the extra
+            columns, false otherwise.
+   */
+  inline bool is_auto_inc_in_extra_columns()
+  {
+    DBUG_ASSERT(m_table);
+    return (m_table->next_number_field &&
+            m_table->next_number_field->field_index >= m_width);
+  }
+#endif
+
+  bool is_rbr_logging_format() const
+  {
+    return true;
+  }
+private:
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  virtual int do_apply_event(Relay_log_info const *rli);
+  virtual int do_update_pos(Relay_log_info *rli);
+  virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
+
+  /*
+    Primitive to prepare for a sequence of row executions.
+
+    DESCRIPTION
+
+      Before doing a sequence of do_prepare_row() and do_exec_row()
+      calls, this member function should be called to prepare for the
+      entire sequence. Typically, this member function will allocate
+      space for any buffers that are needed for the two member
+      functions mentioned above.
+
+    RETURN VALUE
+
+      The member function will return 0 if all went OK, or a non-zero
+      error code otherwise.
+  */
+  virtual
+  int do_before_row_operations(const Slave_reporting_capability *const log) = 0;
+
+  /*
+    Primitive to clean up after a sequence of row executions.
+
+    DESCRIPTION
+
+      After doing a sequence of do_prepare_row() and do_exec_row(),
+      this member function should be called to clean up and release
+      any allocated buffers.
+
+      The error argument, if non-zero, indicates an error which happened during
+      row processing before this function was called. In this case, even if
+      function is successful, it should return the error code given in the argument.
+  */
+  virtual
+  int do_after_row_operations(const Slave_reporting_capability *const log,
+                              int error) = 0;
+
+  /*
+    Primitive to do the actual execution necessary for a row.
+
+    DESCRIPTION
+      The member function will do the actual execution needed to handle a row.
+      The row is located at m_curr_row. When the function returns,
+      m_curr_row_end should point at the next row (one byte after the end
+      of the current row).
+
+    RETURN VALUE
+      0 if execution succeeded, 1 if execution failed.
+
+  */
+  virtual int do_exec_row(const Relay_log_info *const rli) = 0;
+
+  /**
+    Private member function called while handling idempotent errors.
+
+    @param err[IN/OUT] the error to handle. If it is listed as
+                       idempotent/ignored related error, then it is cleared.
+    @returns true if the slave should stop executing rows.
+   */
+  int handle_idempotent_and_ignored_errors(Relay_log_info const *rli, int *err);
+
+  /**
+     Private member function called after updating/deleting a row. It
+     performs some assertions and more importantly, it updates
+     m_curr_row so that the next row is processed during the row
+     execution main loop (@c Rows_log_event::do_apply_event()).
+
+     @param err[IN] the current error code.
+   */
+  void do_post_row_operations(Relay_log_info const *rli, int err);
+
+  /**
+     Commodity wrapper around do_exec_row(), that deals with resetting
+     the thd reference in the table.
+   */
+  int do_apply_row(Relay_log_info const *rli);
+
+  /**
+     Implementation of the index scan and update algorithm. It uses
+     PK, UK or regular Key to search for the record to update. When
+     found it updates it.
+   */
+  int do_index_scan_and_update(Relay_log_info const *rli);
+
+  /**
+     Implementation of the hash_scan and update algorithm. It collects
+     rows positions in a hashtable until the last row is
+     unpacked. Then it scans the table to update and when a record in
+     the table matches the one in the hashtable, the update/delete is
+     performed.
+   */
+  int do_hash_scan_and_update(Relay_log_info const *rli);
+
+  /**
+     Implementation of the legacy table_scan and update algorithm. For
+     each unpacked row it scans the storage engine table for a
+     match. When a match is found, the update/delete operations are
+     performed.
+   */
+  int do_table_scan_and_update(Relay_log_info const *rli);
+
+  /**
+    Initializes scanning of rows. Opens an index and initailizes an iterator
+    over a list of distinct keys (m_distinct_keys) if it is a HASH_SCAN
+    over an index or the table if its a HASH_SCAN over the table.
+  */
+  int open_record_scan();
+
+  /**
+    Does the cleanup
+    - closes the index if opened by open_record_scan
+    - closes the table if opened for scanning.
+  */
+  int close_record_scan();
+
+  /**
+    Fetches next row. If it is a HASH_SCAN over an index, it populates
+    table->record[0] with the next row corresponding to the index. If
+    the indexes are in non-contigous ranges it fetches record corresponding
+    to the key value in the next range.
+
+    @parms: bool first_read : signifying if this is the first time we are reading a row
+            over an index.
+    @return_value: -  error code when there are no more reeords to be fetched or some other
+                      error occured,
+                   -  0 otherwise.
+  */
+  int next_record_scan(bool first_read);
+
+  /**
+    Populates the m_distinct_keys with unique keys to be modified
+    during HASH_SCAN over keys.
+    @return_value -0 success
+                  -Err_code
+  */
+  int add_key_to_distinct_keyset();
+
+  /**
+    Populates the m_hash when using HASH_SCAN. Thence, it:
+    - unpacks the before image (BI)
+    - saves the positions
+    - saves the positions into the hash map, using the
+      BI checksum as key
+    - unpacks the after image (AI) if needed, so that
+      m_curr_row_end gets updated correctly.
+
+    @param rli The reference to the relay log info object.
+    @returns 0 on success. Otherwise, the error code.
+  */
+  int do_hash_row(Relay_log_info const *rli);
+
+  /**
+    This member function scans the table and applies the changes
+    that had been previously hashed. As such, m_hash MUST be filled
+    by do_hash_row before calling this member function.
+
+    @param rli The reference to the relay log info object.
+    @returns 0 on success. Otherwise, the error code.
+  */
+  int do_scan_and_update(Relay_log_info const *rli);
+#endif /* defined(MYSQL_SERVER) && defined(HAVE_REPLICATION) */
+
+  friend class Old_rows_log_event;
+};
+
+
+/**
+  @class Write_rows_log_event
+
+  Log row insertions and updates. The event contain several
+  insert/update rows for a table. Note that each event contains only
+  rows for one table.
+
+  @internal
+  The inheritance structure is as follows
+
+                         Binary_log_event
+                                  ^
+                                  |
+                                  |
+                                  |
+                Log_event   B_l:Rows_event
+                     ^            /\
+                     |           /  \
+                     |   <<vir>>/    \ <<vir>>
+                     |         /      \
+                     |        /        \
+                     |       /          \
+                  Rows_log_event    B_l:W_R_E
+                             \          /
+                              \        /
+                               \      /
+                                \    /
+                                 \  /
+                                  \/
+                        Write_rows_log_event
+
+  B_l: Namespace Binary_log
+  W_R_E: class Write_rows_event
+  @endinternal
+
+*/
+class Write_rows_log_event : public Rows_log_event,
+                             public binary_log::Write_rows_event
+{
+public:
+  enum
+  {
+    /* Support interface to THD::binlog_prepare_pending_rows_event */
+    TYPE_CODE = binary_log::WRITE_ROWS_EVENT
+  };
+
+#if defined(MYSQL_SERVER)
+  Write_rows_log_event(THD*, TABLE*, const Table_id& table_id,
+		       bool is_transactional,
+                       const uchar* extra_row_info);
+#endif
+
+  Write_rows_log_event(const char *buf, uint event_len,
+                       const Format_description_event *description_event);
+
+#if defined(MYSQL_SERVER)
+  static bool binlog_row_logging_function(THD *thd, TABLE *table,
+                                          bool is_transactional,
+                                          const uchar *before_record
+                                          MY_ATTRIBUTE((unused)),
+                                          const uchar *after_record)
+  {
+    return thd->binlog_write_row(table, is_transactional,
+                                 after_record, NULL);
+  }
+#endif
+
+protected:
+  int write_row(const Relay_log_info *const, const bool);
+
+private:
+  virtual Log_event_type get_general_type_code()
+  {
+    return (Log_event_type)TYPE_CODE;
+  }
+
+#ifdef MYSQL_CLIENT
+  //void print(FILE *file, PRINT_EVENT_INFO *print_event_info);
+#endif
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  virtual int do_before_row_operations(const Slave_reporting_capability *const);
+  virtual int do_after_row_operations(const Slave_reporting_capability *const,int);
+  virtual int do_exec_row(const Relay_log_info *const);
+#endif
+};
+
 #endif /* _log_event_h */

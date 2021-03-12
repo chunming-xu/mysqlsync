@@ -102,24 +102,30 @@ Log_event_footer::get_checksum_alg(const char* buf, unsigned long len)
 
 uint32_t inline le32toh(uint32_t x)
 {
+    /*
     return (((x >> 24) & 0xff) |
             ((x <<  8) & 0xff0000) |
             ((x >>  8) & 0xff00) |
             ((x << 24) & 0xff000000));
+    */        
+   return x;
 }
 uint64_t inline le64toh(uint64_t x)
 {
-
+    /*
     x = ((x << 8) & 0xff00ff00ff00ff00ULL) |
         ((x >> 8) & 0x00ff00ff00ff00ffULL);
     x = ((x << 16) & 0xffff0000ffff0000ULL) |
         ((x >> 16) & 0x0000ffff0000ffffULL);
     return (x << 32) | (x >> 32);
+    */
+   return x;
 }
 
 uint16_t inline le16toh(uint16_t x)
 {
-    return ((x >> 8) | (x << 8));
+    //return ((x >> 8) | (x << 8));
+    return x;
 }
 
 /**

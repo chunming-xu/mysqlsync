@@ -250,6 +250,301 @@ static void set_thd_db(THD *thd, const char *db, size_t db_len)
 #endif
 
 
+static inline void int3store(uchar *T, uint A)
+{
+  *(T)=   (uchar) (A);
+  *(T+1)= (uchar) (A >> 8);
+  *(T+2)= (uchar) (A >> 16);
+}
+
+static inline void int8store(uchar *T, ulonglong A)
+{
+  *((ulonglong*) T)= A;
+}
+
+uchar *net_store_length(uchar *packet, ulonglong length)
+{
+  if (length < (ulonglong) 251LL)
+  {
+    *packet=(uchar) length;
+    return packet+1;
+  }
+  /* 251 is reserved for NULL */
+  if (length < (ulonglong) 65536LL)
+  {
+    *packet++=252;
+    int2store(packet,(uint) length);
+    return packet+2;
+  }
+  if (length < (ulonglong) 16777216LL)
+  {
+    *packet++=253;
+    int3store(packet,(ulong) length);
+    return packet+3;
+  }
+  *packet++=254;
+  int8store(packet,length);
+  return packet+8;
+}
+#define bitmap_buffer_size(bits) (((bits)+31)/32)*4
+#define MY_ALIGN(A,L)	(((A) + (L) - 1) & ~((L) - 1))
+#define ALIGN_SIZE(A)	MY_ALIGN((A),sizeof(double))
+
+void create_last_word_mask(MY_BITMAP *map)
+{
+  /* Get the number of used bits (1..8) in the last byte */
+  unsigned int const used= 1U + ((map->n_bits-1U) & 0x7U);
+
+  /*
+    Create a mask with the upper 'unused' bits set and the lower 'used'
+    bits clear. The bits within each byte is stored in big-endian order.
+   */
+  unsigned char const mask= (~((1 << used) - 1)) & 255;
+
+  /*
+    The first bytes are to be set to zero since they represent real  bits
+    in the bitvector. The last bytes are set to 0xFF since they  represent
+    bytes not used by the bitvector. Finally the last byte contains  bits
+    as set by the mask above.
+  */
+  unsigned char *ptr= (unsigned char*)&map->last_word_mask;
+
+  /* Avoid out-of-bounds read/write if we have zero bits. */
+  map->last_word_ptr= map->n_bits == 0 ? map->bitmap :
+    map->bitmap + no_words_in_map(map) - 1;
+
+  switch (no_bytes_in_map(map) & 3) {
+  case 1:
+    map->last_word_mask= ~0U;
+    ptr[0]= mask;
+    return;
+  case 2:
+    map->last_word_mask= ~0U;
+    ptr[0]= 0;
+    ptr[1]= mask;
+    return;
+  case 3:
+    map->last_word_mask= 0U;
+    ptr[2]= mask;
+    ptr[3]= 0xFFU;
+    return;
+  case 0:
+    map->last_word_mask= 0U;
+    ptr[3]= mask;
+    return;
+  }
+}
+static inline void bitmap_clear_all(MY_BITMAP *map)
+{
+  memset(map->bitmap, 0, 4 * no_words_in_map(map));
+}
+my_bool bitmap_init(MY_BITMAP *map, my_bitmap_map *buf, uint n_bits,
+		    my_bool thread_safe )
+{
+  if (!buf)
+  {
+    uint size_in_bytes= bitmap_buffer_size(n_bits);
+    uint extra= 0;
+
+    if (thread_safe)
+    {
+      size_in_bytes= ALIGN_SIZE(size_in_bytes);
+      extra= sizeof(pthread_mutex_t);
+    }
+    map->mutex= 0;
+
+    if (!(buf= (my_bitmap_map*) malloc(size_in_bytes+extra)))
+      return 1;
+
+    if (thread_safe)
+    {
+      map->mutex= (pthread_mutex_t *) ((char*) buf + size_in_bytes);
+      pthread_mutex_init( map->mutex, NULL);
+    }
+
+  }
+
+  else
+  {
+    map->mutex= NULL;
+  }
+
+  map->bitmap= buf;
+  map->n_bits= n_bits;
+  create_last_word_mask(map);
+  bitmap_clear_all(map);
+  return 0;
+}
+
+Rows_log_event::Rows_log_event(const char *buf, uint event_len,
+                               const Format_description_event
+                               *description_event)
+: binary_log::Rows_event(buf, event_len, description_event),
+  Log_event(header(), footer()),
+  m_row_count(0),
+#ifndef MYSQL_CLIENT
+  //m_table(NULL),
+#endif
+  m_rows_buf(0), m_rows_cur(0), m_rows_end(0)
+#if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
+    , m_curr_row(NULL), m_curr_row_end(NULL), m_key(NULL), m_key_info(NULL),
+    m_distinct_keys(Key_compare(&m_key_info)), m_distinct_key_spare_buf(NULL)
+#endif
+{
+  /*
+  if (m_extra_row_data)
+    DBUG_EXECUTE_IF("extra_row_data_check",
+                    check_extra_data(m_extra_row_data););
+  */
+
+  /*
+     m_cols and m_cols_ai are of the type MY_BITMAP, which are members of
+     class Rows_log_event, and are used while applying the row events on
+     the slave.
+     The bitmap integer is initialized by copying the contents of the
+     vector column_before_image for m_cols.bitamp, and vector
+     column_after_image for m_cols_ai.bitmap. m_cols_ai is only initialized
+     for UPDATE_ROWS_EVENTS, else it is equal to the before image.
+  */
+  memset(&m_cols, 0, sizeof(m_cols));
+  /* if bitmap_init fails, is_valid will be set to false */
+  if (!bitmap_init(&m_cols,
+                          m_width <= sizeof(m_bitbuf) * 8 ? m_bitbuf : NULL,
+                          m_width,
+                          false))
+  {
+    if (!columns_before_image.empty())
+    {
+      memcpy(m_cols.bitmap, &columns_before_image[0], (m_width + 7) / 8);
+      create_last_word_mask(&m_cols);
+    
+    } //end if columns_before_image.empty()
+    else
+    m_cols.bitmap= NULL;
+  }
+  else
+  {
+    // Needed because bitmap_init() does not set it to null on failure
+    m_cols.bitmap= NULL;
+    return;
+  }
+  m_cols_ai.bitmap= m_cols.bitmap; //See explanation below while setting is_valid.
+
+  if ((m_type == binary_log::UPDATE_ROWS_EVENT) ||
+      (m_type == binary_log::UPDATE_ROWS_EVENT_V1))
+  {
+    /* if bitmap_init fails, is_valid will be set to false*/
+    if (!bitmap_init(&m_cols_ai,
+                            m_width <= sizeof(m_bitbuf_ai) * 8 ?
+                                        m_bitbuf_ai : NULL,
+                            m_width,
+                            false))
+    {
+      if (!columns_after_image.empty())
+      {
+        memcpy(m_cols_ai.bitmap, &columns_after_image[0], (m_width + 7) / 8);
+        create_last_word_mask(&m_cols_ai);
+      }
+      else
+        m_cols_ai.bitmap= NULL;
+    }
+    else
+    {
+      // Needed because bitmap_init() does not set it to null on failure
+      m_cols_ai.bitmap= 0;
+      return;
+    }
+  }
+
+
+  /*
+    m_rows_buf, m_cur_row and m_rows_end are pointers to the vector rows.
+    m_rows_buf is the pointer to the first byte of first row in the event.
+    m_curr_row points to current row being applied on the slave. Initially,
+    this points to the same element as m_rows_buf in the vector.
+    m_rows_end points to the last byte in the last row in the event.
+
+    These pointers are used while applying the events on to the slave, and
+    are not required for decoding.
+  */
+  if (!row.empty())
+  {
+    m_rows_buf= &row[0];
+#if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
+    m_curr_row= m_rows_buf;
+#endif
+    m_rows_end= m_rows_buf + row.size() - 1;
+    m_rows_cur= m_rows_end;
+  }
+  /*
+    -Check that malloc() succeeded in allocating memory for the row
+     buffer and the COLS vector.
+    -Checking that an Update_rows_log_event
+     is valid is done while setting the Update_rows_log_event::is_valid
+  */
+  if (m_rows_buf && m_cols.bitmap)
+    is_valid_param= true;
+}
+void bitmap_free(MY_BITMAP *map)
+{
+  if (map->bitmap)
+  {
+    if (map->mutex)
+      pthread_mutex_destroy(map->mutex);
+
+    my_free(map->bitmap);
+    map->bitmap=0;
+  }
+}
+
+Rows_log_event::~Rows_log_event()
+{
+  if (m_cols.bitmap)
+  {
+    if (m_cols.bitmap == m_bitbuf) // no my_malloc happened
+      m_cols.bitmap= 0; // so no my_free in bitmap_free
+    bitmap_free(&m_cols); // To pair with bitmap_init().
+  }
+}
+size_t Rows_log_event::get_data_size()
+{
+  int const general_type_code= get_general_type_code();
+
+  uchar buf[sizeof(m_width) + 1];
+  uchar *end= net_store_length(buf, m_width);
+
+  int data_size= 0;
+  bool is_v2_event= common_header->type_code > binary_log::DELETE_ROWS_EVENT_V1;
+  if (is_v2_event)
+  {
+    data_size= Binary_log_event::ROWS_HEADER_LEN_V2 +
+      (m_extra_row_data ?
+       ROWS_V_TAG_LEN + m_extra_row_data[EXTRA_ROW_INFO_LEN_OFFSET]:
+       0);
+  }
+  else
+  {
+    data_size= Binary_log_event::ROWS_HEADER_LEN_V1;
+  }
+  data_size+= no_bytes_in_map(&m_cols);
+  data_size+= (uint) (end - buf);
+
+  if (general_type_code == binary_log::UPDATE_ROWS_EVENT)
+    data_size+= no_bytes_in_map(&m_cols_ai);
+
+  data_size+= (uint) (m_rows_cur - m_rows_buf);
+  return data_size; 
+}
+
+Write_rows_log_event::Write_rows_log_event(const char *buf, uint event_len,
+                                           const Format_description_event
+                                           *description_event)
+: binary_log::Rows_event(buf, event_len, description_event),
+  Rows_log_event(buf, event_len, description_event),
+  binary_log::Write_rows_event(buf, event_len, description_event)
+{
+}
+
 /*
   pretty_print_str()
 */
@@ -1203,10 +1498,10 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
     case binary_log::PREVIOUS_GTIDS_LOG_EVENT:
       ev = NULL;
       break;
-#if defined(HAVE_REPLICATION)
     case binary_log::WRITE_ROWS_EVENT:
       ev = new Write_rows_log_event(buf, event_len, description_event);
       break;     
+#if defined(HAVE_REPLICATION)      
     case binary_log::UPDATE_ROWS_EVENT:
       ev = new Update_rows_log_event(buf, event_len, description_event);
       break;
@@ -4319,7 +4614,6 @@ int Start_log_event_v3::do_apply_event(Relay_log_info const *rli)
 
 Format_description_log_event::Format_description_log_event(uint8_t binlog_ver, const char* server_ver)
 : binary_log::Start_event_v3(binary_log::FORMAT_DESCRIPTION_EVENT),
-  //Format_description_event(binlog_ver,server_ver)
   Format_description_event(binlog_ver,  (binlog_ver <= 3 || server_ver != 0) ?
                            server_ver : server_version)
 {
@@ -4335,6 +4629,10 @@ Format_description_log_event::Format_description_log_event(uint8_t binlog_ver, c
    with Tomas Ulin first!), and the accompanying test (rpl_row_4_bytes)
    too.
   */
+                  post_header_len[binary_log::TABLE_MAP_EVENT-1]=
+                  post_header_len[binary_log::WRITE_ROWS_EVENT_V1-1]=
+                  post_header_len[binary_log::UPDATE_ROWS_EVENT_V1-1]=
+                  post_header_len[binary_log::DELETE_ROWS_EVENT_V1-1]= 6;
 }
 
 

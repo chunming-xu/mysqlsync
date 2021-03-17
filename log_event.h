@@ -40,6 +40,31 @@ typedef unsigned short uint16;
 typedef int rpl_sidno;
 typedef long long int rpl_gno;
 
+ typedef enum enum_field_types_b {
+  MYSQL_TYPE_DECIMAL_B, MYSQL_TYPE_TINY_B,
+  MYSQL_TYPE_SHORT_B,  MYSQL_TYPE_LONG_B,
+  MYSQL_TYPE_FLOAT_B,  MYSQL_TYPE_DOUBLE_B,
+  MYSQL_TYPE_NULL_B,   MYSQL_TYPE_TIMESTAMP_B,
+  MYSQL_TYPE_LONGLONG_B,MYSQL_TYPE_INT24_B,
+  MYSQL_TYPE_DATE_B,   MYSQL_TYPE_TIME_B,
+  MYSQL_TYPE_DATETIME_B, MYSQL_TYPE_YEAR_B,
+  MYSQL_TYPE_NEWDATE_B, MYSQL_TYPE_VARCHAR_B,
+  MYSQL_TYPE_BIT_B,
+  MYSQL_TYPE_TIMESTAMP2_B,
+  MYSQL_TYPE_DATETIME2_B,
+  MYSQL_TYPE_TIME2_B,
+  MYSQL_TYPE_JSON_B=245,
+  MYSQL_TYPE_NEWDECIMAL_B=246,
+  MYSQL_TYPE_ENUM_B=247,
+  MYSQL_TYPE_SET_B=248,
+  MYSQL_TYPE_TINY_BLOB_B=249,
+  MYSQL_TYPE_MEDIUM_BLOB_B=250,
+  MYSQL_TYPE_LONG_BLOB_B=251,
+  MYSQL_TYPE_BLOB_B=252,
+  MYSQL_TYPE_VAR_STRING_B=253,
+  MYSQL_TYPE_STRING_B=254,
+  MYSQL_TYPE_GEOMETRY_B=255
+} enum_field_types_b;
 
 typedef long int32;
 typedef unsigned int uint32;
@@ -1995,6 +2020,328 @@ public:
 };
 
 
+class table_def
+{
+public:
+  /**
+    Constructor.
+
+    @param types Array of types, each stored as a byte
+    @param size  Number of elements in array 'types'
+    @param field_metadata Array of extra information about fields
+    @param metadata_size Size of the field_metadata array
+    @param null_bitmap The bitmap of fields that can be null
+   */
+  table_def(unsigned char *types, ulong size, uchar *field_metadata,
+            int metadata_size, uchar *null_bitmap, uint16 flags);
+
+  ~table_def();
+
+  /**
+    Return the number of fields there is type data for.
+
+    @return The number of fields that there is type data for.
+   */
+  ulong size() const { return m_size; }
+
+
+  /*
+    Returns internal binlog type code for one field,
+    without translation to real types.
+  */
+  enum_field_types_b binlog_type(ulong index) const
+  {
+    return static_cast<enum_field_types_b>(m_type[index]);
+  }
+  /*
+    Return a representation of the type data for one field.
+
+    @param index Field index to return data for
+
+    @return Will return a representation of the type data for field
+    <code>index</code>. Currently, only the type identifier is
+    returned.
+   */
+  enum_field_types_b type(ulong index) const
+  {
+  
+    /*
+      If the source type is MYSQL_TYPE_STRING, it can in reality be
+      either MYSQL_TYPE_STRING, MYSQL_TYPE_ENUM, or MYSQL_TYPE_SET, so
+      we might need to modify the type to get the real type.
+    */
+    enum_field_types_b source_type= binlog_type(index);
+    uint16 source_metadata= m_field_metadata[index];
+    switch (source_type)
+    {
+    case MYSQL_TYPE_STRING_B:
+    {
+      int real_type= source_metadata >> 8;
+      if (real_type == MYSQL_TYPE_ENUM_B || real_type == MYSQL_TYPE_SET_B)
+        source_type= static_cast<enum_field_types_b>(real_type);
+      break;
+    }
+
+    /*
+      This type has not been used since before row-based replication,
+      so we can safely assume that it really is MYSQL_TYPE_NEWDATE.
+    */
+    case MYSQL_TYPE_DATE_B:
+      source_type= MYSQL_TYPE_NEWDATE_B;
+      break;
+
+    default:
+      /* Do nothing */
+      break;
+    }
+
+    return source_type;
+  }
+
+
+  /*
+    This function allows callers to get the extra field data from the
+    table map for a given field. If there is no metadata for that field
+    or there is no extra metadata at all, the function returns 0.
+
+    The function returns the value for the field metadata for column at 
+    position indicated by index. As mentioned, if the field was a type 
+    that stores field metadata, that value is returned else zero (0) is 
+    returned. This method is used in the unpack() methods of the 
+    corresponding fields to properly extract the data from the binary log 
+    in the event that the master's field is smaller than the slave.
+  */
+  uint16 field_metadata(uint index) const
+  {
+ 
+    if (m_field_metadata_size)
+      return m_field_metadata[index];
+    else
+      return 0;
+  }
+
+  /*
+    This function returns whether the field on the master can be null.
+    This value is derived from field->maybe_null().
+  */
+  my_bool maybe_null(uint index) const
+  {
+    return ((m_null_bits[(index / 8)] & 
+            (1 << (index % 8))) == (1 << (index %8)));
+  }
+
+  /*
+    This function returns the field size in raw bytes based on the type
+    and the encoded field data from the master's raw data. This method can 
+    be used for situations where the slave needs to skip a column (e.g., 
+    WL#3915) or needs to advance the pointer for the fields in the raw 
+    data from the master to a specific column.
+  */
+  uint32 calc_field_size(uint col, uchar *master_data) const;
+
+  /**
+    Decide if the table definition is compatible with a table.
+
+    Compare the definition with a table to see if it is compatible
+    with it.
+
+    A table definition is compatible with a table if:
+      - The columns types of the table definition is a (not
+        necessarily proper) prefix of the column type of the table.
+
+      - The other way around.
+
+      - Each column on the master that also exists on the slave can be
+        converted according to the current settings of @c
+        SLAVE_TYPE_CONVERSIONS.
+
+    @param thd
+    @param rli   Pointer to relay log info
+    @param table Pointer to table to compare with.
+
+    @param[out] tmp_table_var Pointer to temporary table for holding
+    conversion table.
+
+    @retval 1  if the table definition is not compatible with @c table
+    @retval 0  if the table definition is compatible with @c table
+  */
+
+private:
+  ulong m_size;           // Number of elements in the types array
+  unsigned char *m_type;  // Array of type descriptors
+  uint m_field_metadata_size;
+  uint16 *m_field_metadata;
+  uchar *m_null_bits;
+  uint16 m_flags;         // Table flags
+  uchar *m_memory;
+};
+
+
+/**
+  A table definition from the master.
+
+  The responsibilities of this class is:
+  - Extract and decode table definition data from the table map event
+  - Check if table definition in table map is compatible with table
+    definition on slave
+ */
+
+
+/**
+  @class Table_map_log_event
+
+  Table_map_log_event which maps a table definition to a number.
+
+  @internal
+  The inheritance structure in the current design for the classes is
+  as follows:
+
+        Binary_log_event
+               ^
+               |
+               |
+    Table_map_event  Log_event
+                \       /
+                 \     /
+                  \   /
+           Table_map_log_event
+  @endinternal
+*/
+class Table_map_log_event : public binary_log::Table_map_event, public Log_event
+{
+public:
+  /** Constants */
+  enum
+  {
+    TYPE_CODE = binary_log::TABLE_MAP_EVENT
+  };
+
+  /**
+     Enumeration of the errors that can be returned.
+   */
+  enum enum_error
+  {
+    ERR_OPEN_FAILURE = -1,               /**< Failure to open table */
+    ERR_OK = 0,                                 /**< No error */
+    ERR_TABLE_LIMIT_EXCEEDED = 1,      /**< No more room for tables */
+    ERR_OUT_OF_MEM = 2,                         /**< Out of memory */
+    ERR_BAD_TABLE_DEF = 3,     /**< Table definition does not match */
+    ERR_RBR_TO_SBR = 4  /**< daisy-chanining RBR to SBR not allowed */
+  };
+
+
+  enum enum_flag
+  {
+    /**
+       Nothing here right now, but the flags support is there in
+       preparation for changes that are coming.  Need to add a
+       constant to make it compile under HP-UX: aCC does not like
+       empty enumerations.
+    */
+    ENUM_FLAG_COUNT
+  };
+
+  /** Special constants representing sets of flags */
+  enum
+  {
+    TM_NO_FLAGS = 0U,
+    TM_BIT_LEN_EXACT_F = (1U << 0),
+    TM_REFERRED_FK_DB_F = (1U << 1)
+  };
+
+  flag_set get_flags(flag_set flag) const { return m_flags & flag; }
+
+#ifdef MYSQL_SERVER
+  Table_map_log_event(THD *thd_arg, TABLE *tbl, const Table_id& tid,
+                      bool is_transactional);
+#endif
+
+  Table_map_log_event(const char *buf, uint event_len,
+                      const Format_description_event *description_event);
+
+
+  virtual ~Table_map_log_event();
+
+
+  table_def *create_table_def()
+  {
+    return new table_def(m_coltype, m_colcnt, m_field_metadata,
+                         m_field_metadata_size, m_null_bits, m_flags);
+  }
+/*
+  static bool rewrite_db_in_buffer(char **buf, ulong *event_len,
+                                   const Format_description_log_event *fde);
+*/
+  const Table_id& get_table_id() const { return m_table_id; }
+  const char *get_table_name() const { return m_tblnam.c_str(); }
+  const char *get_db_name() const    { return m_dbnam.c_str(); }
+
+  virtual size_t get_data_size() { return m_data_size; }
+#ifdef MYSQL_SERVER
+  virtual int save_field_metadata();
+  virtual bool write_data_header(IO_CACHE *file);
+  virtual bool write_data_body(IO_CACHE *file);
+  virtual const char *get_db() { return m_dbnam.c_str(); }
+  virtual uint8 mts_number_dbs()
+  {
+    return get_flags(TM_REFERRED_FK_DB_F) ? OVER_MAX_DBS_IN_EVENT_MTS : 1;
+  }
+  /**
+     @param[out] arg pointer to a struct containing char* array
+                     pointers be filled in and the number of filled instances.
+
+     @return    number of databases in the array: either one or
+                OVER_MAX_DBS_IN_EVENT_MTS, when the Table map event reports
+                foreign keys constraint.
+  */
+  virtual uint8 get_mts_dbs(Mts_db_names *arg)
+  {
+    const char *db_name= get_db();
+
+    if (!rpl_filter->is_rewrite_empty() && !get_flags(TM_REFERRED_FK_DB_F))
+    {
+      size_t dummy_len;
+      const char *db_filtered= rpl_filter->get_rewrite_db(db_name, &dummy_len);
+      // db_name != db_filtered means that db_name is rewritten.
+      if (strcmp(db_name, db_filtered))
+        db_name= db_filtered;
+    }
+
+    if (!get_flags(TM_REFERRED_FK_DB_F))
+      arg->name[0]= db_name;
+
+    return arg->num= mts_number_dbs();
+  }
+
+#endif
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  virtual int pack_info(Protocol *protocol);
+#endif
+
+
+  //virtual void print(FILE *file, PRINT_EVENT_INFO *print_event_info);
+
+
+  bool is_rbr_logging_format() const
+  {
+    return true;
+  }
+
+private:
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  virtual int do_apply_event(Relay_log_info const *rli);
+  virtual int do_update_pos(Relay_log_info *rli);
+  virtual enum_skip_reason do_shall_skip(Relay_log_info *rli);
+#endif
+
+#ifdef MYSQL_SERVER
+  TABLE         *m_table;
+#endif
+};
+
+
+
 /**
   @class Rows_log_event
 
@@ -2067,7 +2414,9 @@ public:
   void clear_flags(flag_set flags_arg) { m_flags &= ~flags_arg; }
   flag_set get_flags(flag_set flags_arg) const { return m_flags & flags_arg; }
 
-  virtual Log_event_type get_general_type_code() = 0; /* General rows op type, no version */
+  void print_verbose(Table_map_log_event *map);
+  size_t print_verbose_one_row(table_def *td, MY_BITMAP *cols_bitmap,
+                               const uchar *ptr, const uchar *prefix);
 
 #ifdef MYSQL_SERVER
   int add_row_data(uchar *data, size_t length)
@@ -2078,6 +2427,7 @@ public:
 
   /* Member functions to implement superclass interface */
   virtual size_t get_data_size();
+  virtual Log_event_type get_general_type_code() = 0; /* General rows op type, no version */
 
   MY_BITMAP const *get_cols() const { return &m_cols; }
   MY_BITMAP const *get_cols_ai() const { return &m_cols_ai; }
@@ -2554,5 +2904,6 @@ private:
   virtual int do_exec_row(const Relay_log_info *const);
 #endif
 };
+
 
 #endif /* _log_event_h */

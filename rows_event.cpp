@@ -120,9 +120,9 @@ Table_map_event::Table_map_event(const char *buf, unsigned int event_len,
   //beginning of post-header
   unsigned int bytes_read= 0;
   uint8_t common_header_len= description_event->common_header_len;
-  uint8_t post_header_len=
-                      description_event->post_header_len[TABLE_MAP_EVENT - 1];
-
+  //uint8_t post_header_len=
+  //                    description_event->post_header_len[TABLE_MAP_EVENT - 1];
+  uint8_t post_header_len= 8;
   /* Set the event data size = post header + body */
   m_data_size= event_len - common_header_len;
 
@@ -130,9 +130,10 @@ Table_map_event::Table_map_event(const char *buf, unsigned int event_len,
   const char *post_start= buf;
 
   post_start+= TM_MAPID_OFFSET;
+  
   if (post_header_len == 6)
   {
-    /* Master is of an intermediate source tree before 5.1.4. Id is 4 bytes */
+    
     uint64_t table_id = 0;
     memcpy(&table_id, post_start, 4);
     m_table_id= le64toh(table_id);
@@ -140,7 +141,7 @@ Table_map_event::Table_map_event(const char *buf, unsigned int event_len,
   }
   else
   {
- 
+  
     uint64_t table_id = 0;
     memcpy(&table_id, post_start, 6);
     m_table_id= le64toh(table_id);

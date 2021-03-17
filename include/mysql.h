@@ -104,7 +104,7 @@ typedef enum enum_field_types {
   MYSQL_TYPE_VAR_STRING=253,
   MYSQL_TYPE_STRING=254,
   MYSQL_TYPE_GEOMETRY=255
-} enum_field_types;
+} enum_field_types; 
 
 typedef struct st_mysql_field {
   char *name;                 /* Name of column */

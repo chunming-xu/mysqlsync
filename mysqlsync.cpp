@@ -23,6 +23,9 @@ unsigned long cli_safe_read(MYSQL *mysql, my_bool *is_data_packet);
 #define CR_COMMANDS_OUT_OF_SYNC 2014
 const char	*unknown_sqlstate= "HY000";
 
+//table_map事件
+Table_map_log_event *g_map = NULL;
+
 typedef struct st_mysql_methods
 {
   my_bool (*read_query_result)(MYSQL *mysql);
@@ -192,21 +195,26 @@ int process_event(const char* buf, uint event_len)
          switch (ev->get_type_code())
          {
            case QUERY_EVENT:
-  
                strcpy(szSQLString, ( static_cast< Query_log_event* >( ev ) ) -> query);	
                printf("szSQLString=%s\n",szSQLString);
                break;
-          case PRE_GA_WRITE_ROWS_EVENT:
-          case WRITE_ROWS_EVENT:
-          case WRITE_ROWS_EVENT_V1:
-               printf("write event \n");
-               break;
-          case ROWS_QUERY_LOG_EVENT:
-               strcpy(szSQLString, ( static_cast< Rows_query_log_event* >( ev ) ) -> m_rows_query);	
-               printf("szSQLString=%s\n",szSQLString);
-               break;          
-           default:
-               printf("default\n");
+           case TABLE_MAP_EVENT:
+                //{数据库名、表名、字段个数}
+                g_map = static_cast< Table_map_log_event* >( ev );
+                break;
+           case PRE_GA_WRITE_ROWS_EVENT:
+           case WRITE_ROWS_EVENT:
+           case WRITE_ROWS_EVENT_V1:
+                printf("write event \n");
+                if(g_map)
+                    static_cast< Write_rows_log_event* >( ev )->print_verbose(g_map);
+                break;
+           case ROWS_QUERY_LOG_EVENT:
+                strcpy(szSQLString, ( static_cast< Rows_query_log_event* >( ev ) ) -> m_rows_query);	
+                printf("szSQLString=%s\n",szSQLString);
+                break;          
+            default:
+                printf("default\n");
          }
     }
     

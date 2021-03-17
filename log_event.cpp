@@ -21,7 +21,9 @@
 
 using std::min;
 using std::max;
-char _dig_vec_upper[64];
+//char _dig_vec_upper[64];
+char _dig_vec_upper[] =
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 #define my_b_write(info,Buffer,Count) \
  ((info)->write_pos + (Count) <=(info)->write_end ?\
@@ -1454,6 +1456,10 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
     case binary_log::FORMAT_DESCRIPTION_EVENT:
       //ev = new Format_description_log_event(buf, event_len, description_event);
       break;
+    case binary_log::TABLE_MAP_EVENT:
+      if (!(description_event->post_header_len.empty()))
+        ev = new Table_map_log_event(buf, event_len, description_event);
+      break;      
 #if defined(HAVE_REPLICATION)
     case binary_log::PRE_GA_WRITE_ROWS_EVENT:
       ev = new Write_rows_log_event_old(buf, event_len, description_event);
@@ -1476,10 +1482,7 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
       if (!(description_event->post_header_len.empty()))
         ev = new Delete_rows_log_event(buf, event_len, description_event);
       break;
-    case binary_log::TABLE_MAP_EVENT:
-      if (!(description_event->post_header_len.empty()))
-        ev = new Table_map_log_event(buf, event_len, description_event);
-      break;
+
 #endif
     case binary_log::BEGIN_LOAD_QUERY_EVENT:
       ev = NULL;
@@ -1583,6 +1586,775 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
   //DBUG_RETURN(ev);  
   return ev;
 }
+const char _my_bits_nbits[256] = {
+  0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+  1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+  1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+  1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+  2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+  3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+  3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+  4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8,
+};
+
+static inline uint my_count_bits_uint32(uint32 v)
+{
+  return (uint) (uchar) (_my_bits_nbits[(uchar)  v] +
+                         _my_bits_nbits[(uchar) (v >> 8)] +
+                         _my_bits_nbits[(uchar) (v >> 16)] +
+                         _my_bits_nbits[(uchar) (v >> 24)]);
+}
+uint bitmap_bits_set(const MY_BITMAP *map)
+{
+  my_bitmap_map *data_ptr= map->bitmap;
+  my_bitmap_map *end= map->last_word_ptr;
+  uint res= 0;
+
+  for (; data_ptr < end; data_ptr++)
+    res+= my_count_bits_uint32(*data_ptr);
+
+  /*Reset last bits to zero*/
+  res+= my_count_bits_uint32(*map->last_word_ptr & ~map->last_word_mask);
+  return res;
+}
+
+static inline my_bool bitmap_is_set(const MY_BITMAP *map, uint bit)
+{
+  return ((uchar*)map->bitmap)[bit / 8] & (1 << (bit & 7));
+}
+
+
+
+static inline int32 sint4korr(const uchar *A) { return *((int32*) A); }
+static inline int16  sint2korr(const uchar *A) { return *((int16*) A); }
+static inline int32 sint3korr(const uchar *A)
+{
+  return
+    ((int32) (((A[2]) & 128) ?
+              (((uint32) 255L << 24) |
+               (((uint32) A[2]) << 16) |
+               (((uint32) A[1]) << 8) |
+               ((uint32) A[0])) :
+              (((uint32) A[2]) << 16) |
+              (((uint32) A[1]) << 8) |
+              ((uint32) A[0])))
+    ;
+}
+static inline uint32 uint3korr(const uchar *A)
+{
+  return
+    (uint32) (((uint32) (A[0])) +
+              (((uint32) (A[1])) << 8) +
+              (((uint32) (A[2])) << 16))
+    ;
+}
+static inline longlong  sint8korr(const uchar *A) { return *((longlong*) A); }
+static inline ulonglong uint8korr(const uchar *A) { return *((ulonglong*) A);}
+static void my_b_write_sint32_and_uint32(int32 si, uint32 ui)
+{
+  printf( "%l", si);
+  if (si < 0)
+    printf( " (%u)", ui);
+}
+
+char *longlong10_to_str(longlong val,char *dst,int radix)
+{
+  char buffer[65];
+  char *p;
+  long long_val;
+  ulonglong uval= (ulonglong) val;
+
+  if (radix < 0)
+  {
+    if (val < 0)
+    {
+      *dst++ = '-';
+      /* Avoid integer overflow in (-val) for LLONG_MIN (BUG#31799). */
+      uval = (ulonglong)0 - uval;
+    }
+  }
+
+  if (uval == 0)
+  {
+    *dst++='0';
+    *dst='\0';
+    return dst;
+  }
+  p = &buffer[sizeof(buffer)-1];
+  *p = '\0';
+
+  while (uval > (ulonglong) LONG_MAX)
+  {
+    ulonglong quo= uval/(uint) 10;
+    uint rem= (uint) (uval- quo* (uint) 10);
+    *--p = _dig_vec_upper[rem];
+    uval= quo;
+  }
+  long_val= (long) uval;
+  while (long_val != 0)
+  {
+    long quo= long_val/10;
+    *--p = _dig_vec_upper[(uchar) (long_val - quo*10)];
+    long_val= quo;
+  }
+  while ((*dst++ = *p++) != 0) ;
+  return dst-1;
+}
+
+#define DIG_PER_DEC1 9
+static const int dig2bytes[DIG_PER_DEC1+1]={0, 1, 1, 2, 2, 3, 3, 4, 4, 4};
+
+int decimal_bin_size(int precision, int scale)
+{
+  int intg=precision-scale,
+      intg0=intg/DIG_PER_DEC1, frac0=scale/DIG_PER_DEC1,
+      intg0x=intg-intg0*DIG_PER_DEC1, frac0x=scale-frac0*DIG_PER_DEC1;
+
+  return intg0*sizeof(int32)+dig2bytes[intg0x]+
+         frac0*sizeof(int32)+dig2bytes[frac0x];
+}
+
+inline int my_decimal_get_binary_size(uint precision, uint scale)
+{
+  return decimal_bin_size((int)precision, (int)scale);
+}
+static void
+my_b_write_bit(const uchar *ptr, uint nbits)
+{
+  uint bitnum, nbits8= ((nbits + 7) / 8) * 8, skip_bits= nbits8 - nbits;
+  printf( "b'");
+  for (bitnum= skip_bits ; bitnum < nbits8; bitnum++)
+  {
+    int is_set= (ptr[(bitnum) / 8] >> (7 - bitnum % 8))  & 0x01;
+    printf("%c", (const uchar*) (is_set ? "1" : "0"), 1);
+  }
+  printf("'");
+}
+
+static void
+my_b_write_quoted(IO_CACHE *file, const uchar *ptr, uint length)
+{
+  const uchar *s;
+  printf( "'");
+  for (s= ptr; length > 0 ; s++, length--)
+  {
+    if (*s > 0x1F && *s != '\'' && *s != '\\')
+      ;//my_b_write(file, s, 1);
+    else
+    {
+      uchar hex[10];
+      size_t len= snprintf((char*) hex, sizeof(hex), "%s%02x", "\\x", *s);
+      //my_b_write(file, hex, len);
+    }
+  }
+  printf( "'");
+}
+
+static size_t
+my_b_write_quoted_with_length(IO_CACHE *file, const uchar *ptr, uint length)
+{
+  if (length < 256)
+  {
+    length= *ptr;
+    my_b_write_quoted(file, ptr + 1, length);
+    return length + 1;
+  }
+  else
+  {
+    length= uint2korr(ptr);
+    my_b_write_quoted(file, ptr + 2, length);
+    return length + 2;
+  }
+}
+/**
+  Print a packed value of the given SQL type into IO cache
+  
+  @param[in] file              IO cache
+  @param[in] ptr               Pointer to string
+  @param[in] type              Column type
+  @param[in] meta              Column meta information
+  @param[out] typestr          SQL type string buffer (for verbose output)
+  @param[out] typestr_length   Size of typestr
+  
+  @retval   - number of bytes scanned from ptr.
+*/
+static size_t
+log_event_print_value( const uchar *ptr,
+                      uint type, uint meta,
+                      char *typestr, size_t typestr_length)
+{
+  uint32 length= 0;
+
+  if (type == MYSQL_TYPE_STRING_B)
+  {
+    if (meta >= 256)
+    {
+      uint byte0= meta >> 8;
+      uint byte1= meta & 0xFF;
+      
+      if ((byte0 & 0x30) != 0x30)
+      {
+        /* a long CHAR() field: see #37426 */
+        length= byte1 | (((byte0 & 0x30) ^ 0x30) << 4);
+        type= byte0 | 0x30;
+      }
+      else
+        length = meta & 0xFF;
+    }
+    else
+      length= meta;
+  }
+
+  switch (type) {
+  case MYSQL_TYPE_LONG_B:
+    {
+      snprintf(typestr, typestr_length, "INT");
+      if(!ptr)
+        return printf("NULL");
+      int32 si= sint4korr(ptr);
+      uint32 ui= uint4korr(ptr);
+      my_b_write_sint32_and_uint32(si, ui);
+      return 4;
+    }
+
+  case MYSQL_TYPE_TINY_B:
+    {
+      snprintf(typestr, typestr_length, "TINYINT");
+      if(!ptr)
+        return printf("NULL");
+      my_b_write_sint32_and_uint32((int) (signed char) *ptr,
+                                  (uint) (unsigned char) *ptr);
+      return 1;
+    }
+
+  case MYSQL_TYPE_SHORT_B:
+    {
+      snprintf(typestr, typestr_length, "SHORTINT");
+      if(!ptr)
+        return printf("NULL");
+      int32 si= (int32) sint2korr(ptr);
+      uint32 ui= (uint32) uint2korr(ptr);
+      my_b_write_sint32_and_uint32( si, ui);
+      return 2;
+    }
+  
+  case MYSQL_TYPE_INT24_B:
+    {
+      snprintf(typestr, typestr_length, "MEDIUMINT");
+      if(!ptr)
+        return printf("NULL");
+      int32 si= sint3korr(ptr);
+      uint32 ui= uint3korr(ptr);
+      my_b_write_sint32_and_uint32( si, ui);
+      return 3;
+    }
+
+  case MYSQL_TYPE_LONGLONG_B:
+    {
+      snprintf(typestr, typestr_length, "LONGINT");
+      if(!ptr)
+        return printf("NULL");
+      char tmp[64];
+      longlong si= sint8korr(ptr);
+      longlong10_to_str(si, tmp, -10);
+      printf("%s", tmp);
+      if (si < 0)
+      {
+        ulonglong ui= uint8korr(ptr);
+        longlong10_to_str((longlong) ui, tmp, 10);
+        printf(" (%s)", tmp);        
+      }
+      return 8;
+    }
+
+  /*
+  case MYSQL_TYPE_NEWDECIMAL_B:
+    {
+      uint precision= meta >> 8;
+      uint decimals= meta & 0xFF;
+      snprintf(typestr, typestr_length, "DECIMAL(%d,%d)",
+                  precision, decimals);
+      if(!ptr)
+        return printf("NULL");
+      uint bin_size= my_decimal_get_binary_size(precision, decimals);
+      my_decimal dec;
+      binary2my_decimal(E_DEC_FATAL_ERROR, (uchar*) ptr, &dec,
+                        precision, decimals);
+      int len= DECIMAL_MAX_STR_LENGTH;
+      char buff[DECIMAL_MAX_STR_LENGTH + 1];
+      decimal2string(&dec,buff,&len, 0, 0, 0);
+      my_b_printf(file, "%s", buff);
+      return bin_size;
+    }
+    */
+  /*
+  case MYSQL_TYPE_FLOAT_B:
+    {
+      snprintf(typestr, typestr_length, "FLOAT");
+      if(!ptr)
+        return printf(file, "NULL");
+      float fl;
+      float4get(&fl, ptr);
+      char tmp[320];
+      sprintf(tmp, "%-20g", (double) fl);
+      my_b_printf(file, "%s", tmp); 
+      return 4;
+    }
+    
+
+  case MYSQL_TYPE_DOUBLE_B:
+    {
+      strcpy(typestr, "DOUBLE");
+      if(!ptr)
+        return my_b_printf(file, "NULL");
+      double dbl;
+      float8get(&dbl, ptr);
+      char tmp[320];
+      sprintf(tmp, "%-.20g", dbl); 
+      my_b_printf(file, "%s", tmp);
+      return 8;
+    }
+  
+
+  case MYSQL_TYPE_BIT_B:
+    {
+      
+      uint nbits= ((meta >> 8) * 8) + (meta & 0xFF);
+      my_snprintf(typestr, typestr_length, "BIT(%d)", nbits);
+      if(!ptr)
+        return my_b_printf(file, "NULL");
+      length= (nbits + 7) / 8;
+      my_b_write_bit(file, ptr, nbits);
+      return length;
+    }
+    */
+
+  case MYSQL_TYPE_TIMESTAMP_B:
+    {
+      snprintf(typestr, typestr_length, "TIMESTAMP");
+      if(!ptr)
+        return printf("NULL");
+      uint32 i32= uint4korr(ptr);
+      printf("%d", i32);
+      return 4;
+    }
+
+ /*
+  case MYSQL_TYPE_TIMESTAMP2_B:
+    {
+      snprintf(typestr, typestr_length, "TIMESTAMP(%d)", meta);
+      if(!ptr)
+        return printf("NULL");
+      char buf[MAX_DATE_STRING_REP_LENGTH];
+      struct timeval tm;
+      my_timestamp_from_binary(&tm, ptr, meta);
+      int buflen= my_timeval_to_str(&tm, buf, meta);
+      my_b_write(file, buf, buflen);
+      return my_timestamp_binary_length(meta);
+    }
+    */
+
+  case MYSQL_TYPE_DATETIME_B:
+    {
+      snprintf(typestr, typestr_length, "DATETIME");
+      if(!ptr)
+        return printf("NULL");
+      size_t d, t;
+      uint64 i64= uint8korr(ptr); /* YYYYMMDDhhmmss */
+      d= static_cast<size_t>(i64 / 1000000);
+      t= i64 % 1000000;
+      printf("%04d-%02d-%02d %02d:%02d:%02d",
+                  static_cast<int>(d / 10000),
+                  static_cast<int>(d % 10000) / 100,
+                  static_cast<int>(d % 100),
+                  static_cast<int>(t / 10000),
+                  static_cast<int>(t % 10000) / 100,
+                  static_cast<int>(t % 100));
+      return 8;
+    }
+  
+  /*
+  case MYSQL_TYPE_DATETIME2_B:
+    {
+      my_snprintf(typestr, typestr_length, "DATETIME(%d)", meta);
+      if(!ptr)
+        return my_b_printf(file, "NULL");
+      char buf[MAX_DATE_STRING_REP_LENGTH];
+      MYSQL_TIME ltime;
+      longlong packed= my_datetime_packed_from_binary(ptr, meta);
+      TIME_from_longlong_datetime_packed(&ltime, packed);
+      int buflen= my_datetime_to_str(&ltime, buf, meta);
+      my_b_write_quoted(file, (uchar *) buf, buflen);
+      return my_datetime_binary_length(meta);
+    }
+    */
+
+  case MYSQL_TYPE_TIME_B:
+    {
+      snprintf(typestr, typestr_length, "TIME");
+      if(!ptr)
+        return printf( "NULL");
+      uint32 i32= uint3korr(ptr);
+      printf( "'%02d:%02d:%02d'",
+                  i32 / 10000, (i32 % 10000) / 100, i32 % 100);
+      return 3;
+    }
+  /*
+  case MYSQL_TYPE_TIME2_B:
+    {
+      my_snprintf(typestr, typestr_length, "TIME(%d)", meta);
+      if(!ptr)
+        return my_b_printf(file, "NULL");
+      char buf[MAX_DATE_STRING_REP_LENGTH];
+      MYSQL_TIME ltime;
+      longlong packed= my_time_packed_from_binary(ptr, meta);
+      TIME_from_longlong_time_packed(&ltime, packed);
+      int buflen= my_time_to_str(&ltime, buf, meta);
+      my_b_write_quoted(file, (uchar *) buf, buflen);
+      return my_time_binary_length(meta);
+    }
+   */
+  case MYSQL_TYPE_NEWDATE_B:
+    {
+      snprintf(typestr, typestr_length, "DATE");
+      if(!ptr)
+        return printf( "NULL");
+      uint32 tmp= uint3korr(ptr);
+      int part;
+      char buf[11];
+      char *pos= &buf[10];  // start from '\0' to the beginning
+
+      /* Copied from field.cc */
+      *pos--=0;					// End NULL
+      part=(int) (tmp & 31);
+      *pos--= (char) ('0'+part%10);
+      *pos--= (char) ('0'+part/10);
+      *pos--= ':';
+      part=(int) (tmp >> 5 & 15);
+      *pos--= (char) ('0'+part%10);
+      *pos--= (char) ('0'+part/10);
+      *pos--= ':';
+      part=(int) (tmp >> 9);
+      *pos--= (char) ('0'+part%10); part/=10;
+      *pos--= (char) ('0'+part%10); part/=10;
+      *pos--= (char) ('0'+part%10); part/=10;
+      *pos=   (char) ('0'+part);
+      printf( "'%s'", buf);
+      return 3;
+    }
+
+  case MYSQL_TYPE_YEAR_B:
+    {
+      snprintf(typestr, typestr_length, "YEAR");
+      if(!ptr)
+        return printf( "NULL");
+      uint32 i32= *ptr;
+      printf( "%04d", i32+ 1900);
+      return 1;
+    }
+  
+  case MYSQL_TYPE_ENUM_B:
+    switch (meta & 0xFF) {
+    case 1:
+      snprintf(typestr, typestr_length, "ENUM(1 byte)");
+      if(!ptr)
+        return printf("NULL");
+      printf( "%d", (int) *ptr);
+      return 1;
+    case 2:
+      {
+        snprintf(typestr, typestr_length, "ENUM(2 bytes)");
+        if(!ptr)
+          return printf("NULL");
+        int32 i32= uint2korr(ptr);
+        printf( "%d", i32);
+        return 2;
+      }
+    default:
+      printf("!! Unknown ENUM packlen=%d", meta & 0xFF); 
+      return 0;
+    }
+    break;
+    
+  case MYSQL_TYPE_SET_B:
+    snprintf(typestr, typestr_length, "SET(%d bytes)", meta & 0xFF);
+    if(!ptr)
+      return printf( "NULL");
+    my_b_write_bit(ptr , (meta & 0xFF) * 8);
+    return meta & 0xFF;
+
+  /*
+  case MYSQL_TYPE_BLOB_B:
+    switch (meta) {
+    case 1:
+      snprintf(typestr, typestr_length, "TINYBLOB/TINYTEXT");
+      if(!ptr)
+        return printf("NULL");
+      length= *ptr;
+      my_b_write_quoted(file, ptr + 1, length);
+      return length + 1;
+    case 2:
+      snprintf(typestr, typestr_length, "BLOB/TEXT");
+      if(!ptr)
+        return printf("NULL");
+      length= uint2korr(ptr);
+      my_b_write_quoted(file, ptr + 2, length);
+      return length + 2;
+    case 3:
+      snprintf(typestr, typestr_length, "MEDIUMBLOB/MEDIUMTEXT");
+      if(!ptr)
+        return printf( "NULL");
+      length= uint3korr(ptr);
+      my_b_write_quoted(file, ptr + 3, length);
+      return length + 3;
+    case 4:
+      snprintf(typestr, typestr_length, "LONGBLOB/LONGTEXT");
+      if(!ptr)
+        return printf("NULL");
+      length= uint4korr(ptr);
+      my_b_write_quoted(file, ptr + 4, length);
+      return length + 4;
+    default:
+      printf( "!! Unknown BLOB packlen=%d", length);
+      return 0;
+    }*/
+
+  case MYSQL_TYPE_VARCHAR_B:
+  case MYSQL_TYPE_VAR_STRING_B:
+    length= meta;
+    snprintf(typestr, typestr_length, "VARSTRING(%d)", length);
+    if(!ptr) 
+      return printf( "NULL");
+    return my_b_write_quoted_with_length(NULL, ptr, length);
+
+  case MYSQL_TYPE_STRING_B:
+    snprintf(typestr, typestr_length, "STRING(%d)", length);
+    if(!ptr)
+      return printf( "NULL");
+    return my_b_write_quoted_with_length(NULL, ptr, length);
+
+  case MYSQL_TYPE_JSON_B:
+    snprintf(typestr, typestr_length, "JSON");
+    if (!ptr)
+      return printf( "NULL");
+    length= uint2korr(ptr);
+    my_b_write_quoted(NULL, ptr + meta, length);
+    return length + meta;
+
+  default:
+    {
+      char tmp[5];
+      snprintf(tmp, sizeof(tmp), "%04x", meta);
+      printf("!! Don't know how to handle column type=%d meta=%d (%s)",
+                  type, meta, tmp);
+    }
+    break;
+  }
+  *typestr= 0;
+  return 0;
+}
+
+
+size_t
+Rows_log_event::print_verbose_one_row(table_def *td,MY_BITMAP *cols_bitmap,
+                                      const uchar *value, const uchar *prefix)
+{
+  const uchar *value0= value;
+  const uchar *null_bits= value;
+  uint null_bit_index= 0;
+  char typestr[64]= "";
+
+  /*
+    Skip metadata bytes which gives the information about nullabity of master
+    columns. Master writes one bit for each affected column.
+   */
+  value+= (bitmap_bits_set(cols_bitmap) + 7) / 8;
+  
+  printf( "%s", prefix);
+  
+  for (size_t i= 0; i < td->size(); i ++)
+  {
+    int is_null= (null_bits[null_bit_index / 8] 
+                  >> (null_bit_index % 8))  & 0x01;
+
+    if (bitmap_is_set(cols_bitmap, i) == 0)
+      continue;
+    
+    printf("###   @%d=", static_cast<int>(i + 1));
+    if (!is_null)
+    {
+      size_t fsize= td->calc_field_size((uint)i, (uchar*) value);
+      if (value + fsize > m_rows_end)
+      {
+        printf("***Corrupted replication event was detected."
+                    " Not printing the value***\n");
+        value+= fsize;
+        return 0;
+      }
+    }
+    size_t size= log_event_print_value(is_null? NULL: value,
+                                         td->type(i), td->field_metadata(i),
+                                         typestr, sizeof(typestr));
+    if (!size)
+      return 0;
+
+    if(!is_null)
+      value+= size;
+
+    //if (print_event_info->verbose > 1)
+    //{
+      printf(" /* ");
+
+      printf( "%s ", typestr);
+      
+      printf( "meta=%d nullable=%d is_null=%d ",
+                  td->field_metadata(i),
+                  td->maybe_null(i), is_null);
+      printf( "*");
+    //}
+    
+    printf( "\n");
+    
+    null_bit_index++;
+  }
+  
+  return value - value0;
+}
+
+/**
+  Print a row event into IO cache in human readable form (in SQL format)
+  
+  @param[in] file              IO cache
+  @param[in] print_event_into  Print parameters
+*/
+//void Rows_log_event::print_verbose(IO_CACHE *file, PRINT_EVENT_INFO *print_event_info)
+void Rows_log_event::print_verbose(Table_map_log_event *map)
+{
+  // Quoted length of the identifier can be twice the original length
+  char quoted_db[1 + NAME_LEN * 2 + 2];
+  char quoted_table[1 + NAME_LEN * 2 + 2];
+  size_t quoted_db_len, quoted_table_len;
+  //Table_map_log_event *map;
+  table_def *td;
+  const char *sql_command, *sql_clause1, *sql_clause2;
+  Log_event_type general_type_code= get_general_type_code();
+  
+  if (m_extra_row_data)
+  {
+    uint8 extra_data_len= m_extra_row_data[EXTRA_ROW_INFO_LEN_OFFSET];
+    uint8 extra_payload_len= extra_data_len - EXTRA_ROW_INFO_HDR_BYTES;
+    assert(extra_data_len >= EXTRA_ROW_INFO_HDR_BYTES);
+
+    printf("### Extra row data format: %u, len: %u :",
+                m_extra_row_data[EXTRA_ROW_INFO_FORMAT_OFFSET],
+                extra_payload_len);
+    if (extra_payload_len)
+    {
+      /*
+         Buffer for hex view of string, including '0x' prefix,
+         2 hex chars / byte and trailing 0
+      */
+      const int buff_len= 2 + (256 * 2) + 1;
+      char buff[buff_len];
+      str_to_hex(buff, (const char*) &m_extra_row_data[EXTRA_ROW_INFO_HDR_BYTES],
+                 extra_payload_len);
+      printf("%s", buff);
+    }
+    printf("\n");
+  }
+
+  switch (general_type_code) {
+  case binary_log::WRITE_ROWS_EVENT:
+    sql_command= "INSERT INTO";
+    sql_clause1= "### SET\n";
+    sql_clause2= NULL;
+    break;
+  case binary_log::DELETE_ROWS_EVENT:
+    sql_command= "DELETE FROM";
+    sql_clause1= "### WHERE\n";
+    sql_clause2= NULL;
+    break;
+  case binary_log::UPDATE_ROWS_EVENT:
+    sql_command= "UPDATE";
+    sql_clause1= "### WHERE\n";
+    sql_clause2= "### SET\n";
+    break;
+  default:
+    sql_command= sql_clause1= sql_clause2= NULL;
+    return; /* Not possible */
+  }
+  
+  td= map->create_table_def();
+  /*
+  if (!(map= print_event_info->m_table_map.get_table(m_table_id)) ||
+      !(td= map->create_table_def()))
+  {
+    char llbuff[22];
+    my_b_printf(file, "### Row event for unknown table #%s",
+                llstr(m_table_id, llbuff));
+    return;
+  }
+  */
+
+  /* If the write rows event contained no values for the AI */
+  if (((general_type_code == binary_log::WRITE_ROWS_EVENT) &&
+      (m_rows_buf==m_rows_end)))
+  {
+    //printf("### INSERT INTO `%s`.`%s` VALUES ()\n", 
+    //                  map->get_db_name(), map->get_table_name());
+    printf("### INSERT INTO  VALUES ()\n");
+    goto end;
+  }
+
+  for (const uchar *value= m_rows_buf; value < m_rows_end; )
+  {
+    size_t length;
+    /*
+#ifdef MYSQL_SERVER
+    quoted_db_len= my_strmov_quoted_identifier(this->thd, (char *) quoted_db,
+                                        map->get_db_name(), 0);
+    quoted_table_len= my_strmov_quoted_identifier(this->thd,
+                                                  (char *) quoted_table,
+                                                  map->get_table_name(), 0);
+#else
+    quoted_db_len= my_strmov_quoted_identifier((char *) quoted_db,
+                                               map->get_db_name());
+    quoted_table_len= my_strmov_quoted_identifier((char *) quoted_table,
+                                          map->get_table_name());
+#endif
+    quoted_db[quoted_db_len]= '\0';
+    quoted_table[quoted_table_len]= '\0';
+    printf("### %s %s.%s\n",
+                      sql_command,
+                      quoted_db, quoted_table);
+                      */
+    /* Print the first image */
+    if (!(length= print_verbose_one_row(td,&m_cols, value,(const uchar*) sql_clause1)))
+      goto end;
+    value+= length;
+
+    /* Print the second image (for UPDATE only) */
+    if (sql_clause2)
+    {
+      if (!(length= print_verbose_one_row(td, &m_cols_ai, value,
+                                      (const uchar*) sql_clause2)))
+        goto end;
+      value+= length;
+    }
+  }
+
+end:
+   return;
+}
+
 
 #ifdef MYSQL_CLIENT
 
@@ -1802,590 +2574,7 @@ my_b_write_sint32_and_uint32(IO_CACHE *file, int32 si, uint32 ui)
 }
 
 
-/**
-  Print a packed value of the given SQL type into IO cache
-  
-  @param[in] file              IO cache
-  @param[in] ptr               Pointer to string
-  @param[in] type              Column type
-  @param[in] meta              Column meta information
-  @param[out] typestr          SQL type string buffer (for verbose output)
-  @param[out] typestr_length   Size of typestr
-  
-  @retval   - number of bytes scanned from ptr.
-*/
-static size_t
-log_event_print_value(IO_CACHE *file, const uchar *ptr,
-                      uint type, uint meta,
-                      char *typestr, size_t typestr_length)
-{
-  uint32 length= 0;
 
-  if (type == MYSQL_TYPE_STRING)
-  {
-    if (meta >= 256)
-    {
-      uint byte0= meta >> 8;
-      uint byte1= meta & 0xFF;
-      
-      if ((byte0 & 0x30) != 0x30)
-      {
-        /* a long CHAR() field: see #37426 */
-        length= byte1 | (((byte0 & 0x30) ^ 0x30) << 4);
-        type= byte0 | 0x30;
-      }
-      else
-        length = meta & 0xFF;
-    }
-    else
-      length= meta;
-  }
-
-  switch (type) {
-  case MYSQL_TYPE_LONG:
-    {
-      my_snprintf(typestr, typestr_length, "INT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      int32 si= sint4korr(ptr);
-      uint32 ui= uint4korr(ptr);
-      my_b_write_sint32_and_uint32(file, si, ui);
-      return 4;
-    }
-
-  case MYSQL_TYPE_TINY:
-    {
-      my_snprintf(typestr, typestr_length, "TINYINT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      my_b_write_sint32_and_uint32(file, (int) (signed char) *ptr,
-                                  (uint) (unsigned char) *ptr);
-      return 1;
-    }
-
-  case MYSQL_TYPE_SHORT:
-    {
-      my_snprintf(typestr, typestr_length, "SHORTINT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      int32 si= (int32) sint2korr(ptr);
-      uint32 ui= (uint32) uint2korr(ptr);
-      my_b_write_sint32_and_uint32(file, si, ui);
-      return 2;
-    }
-  
-  case MYSQL_TYPE_INT24:
-    {
-      my_snprintf(typestr, typestr_length, "MEDIUMINT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      int32 si= sint3korr(ptr);
-      uint32 ui= uint3korr(ptr);
-      my_b_write_sint32_and_uint32(file, si, ui);
-      return 3;
-    }
-
-  case MYSQL_TYPE_LONGLONG:
-    {
-      my_snprintf(typestr, typestr_length, "LONGINT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      char tmp[64];
-      longlong si= sint8korr(ptr);
-      longlong10_to_str(si, tmp, -10);
-      my_b_printf(file, "%s", tmp);
-      if (si < 0)
-      {
-        ulonglong ui= uint8korr(ptr);
-        longlong10_to_str((longlong) ui, tmp, 10);
-        my_b_printf(file, " (%s)", tmp);        
-      }
-      return 8;
-    }
-
-  case MYSQL_TYPE_NEWDECIMAL:
-    {
-      uint precision= meta >> 8;
-      uint decimals= meta & 0xFF;
-      my_snprintf(typestr, typestr_length, "DECIMAL(%d,%d)",
-                  precision, decimals);
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      uint bin_size= my_decimal_get_binary_size(precision, decimals);
-      my_decimal dec;
-      binary2my_decimal(E_DEC_FATAL_ERROR, (uchar*) ptr, &dec,
-                        precision, decimals);
-      int len= DECIMAL_MAX_STR_LENGTH;
-      char buff[DECIMAL_MAX_STR_LENGTH + 1];
-      decimal2string(&dec,buff,&len, 0, 0, 0);
-      my_b_printf(file, "%s", buff);
-      return bin_size;
-    }
-
-  case MYSQL_TYPE_FLOAT:
-    {
-      my_snprintf(typestr, typestr_length, "FLOAT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      float fl;
-      float4get(&fl, ptr);
-      char tmp[320];
-      sprintf(tmp, "%-20g", (double) fl);
-      my_b_printf(file, "%s", tmp); /* my_snprintf doesn't support %-20g */
-      return 4;
-    }
-
-  case MYSQL_TYPE_DOUBLE:
-    {
-      strcpy(typestr, "DOUBLE");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      double dbl;
-      float8get(&dbl, ptr);
-      char tmp[320];
-      sprintf(tmp, "%-.20g", dbl); /* my_snprintf doesn't support %-20g */
-      my_b_printf(file, "%s", tmp);
-      return 8;
-    }
-  
-  case MYSQL_TYPE_BIT:
-    {
-      /* Meta-data: bit_len, bytes_in_rec, 2 bytes */
-      uint nbits= ((meta >> 8) * 8) + (meta & 0xFF);
-      my_snprintf(typestr, typestr_length, "BIT(%d)", nbits);
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      length= (nbits + 7) / 8;
-      my_b_write_bit(file, ptr, nbits);
-      return length;
-    }
-
-  case MYSQL_TYPE_TIMESTAMP:
-    {
-      my_snprintf(typestr, typestr_length, "TIMESTAMP");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      uint32 i32= uint4korr(ptr);
-      my_b_printf(file, "%d", i32);
-      return 4;
-    }
-
-  case MYSQL_TYPE_TIMESTAMP2:
-    {
-      my_snprintf(typestr, typestr_length, "TIMESTAMP(%d)", meta);
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      char buf[MAX_DATE_STRING_REP_LENGTH];
-      struct timeval tm;
-      my_timestamp_from_binary(&tm, ptr, meta);
-      int buflen= my_timeval_to_str(&tm, buf, meta);
-      my_b_write(file, buf, buflen);
-      return my_timestamp_binary_length(meta);
-    }
-
-  case MYSQL_TYPE_DATETIME:
-    {
-      my_snprintf(typestr, typestr_length, "DATETIME");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      size_t d, t;
-      uint64 i64= uint8korr(ptr); /* YYYYMMDDhhmmss */
-      d= static_cast<size_t>(i64 / 1000000);
-      t= i64 % 1000000;
-      my_b_printf(file, "%04d-%02d-%02d %02d:%02d:%02d",
-                  static_cast<int>(d / 10000),
-                  static_cast<int>(d % 10000) / 100,
-                  static_cast<int>(d % 100),
-                  static_cast<int>(t / 10000),
-                  static_cast<int>(t % 10000) / 100,
-                  static_cast<int>(t % 100));
-      return 8;
-    }
-
-  case MYSQL_TYPE_DATETIME2:
-    {
-      my_snprintf(typestr, typestr_length, "DATETIME(%d)", meta);
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      char buf[MAX_DATE_STRING_REP_LENGTH];
-      MYSQL_TIME ltime;
-      longlong packed= my_datetime_packed_from_binary(ptr, meta);
-      TIME_from_longlong_datetime_packed(&ltime, packed);
-      int buflen= my_datetime_to_str(&ltime, buf, meta);
-      my_b_write_quoted(file, (uchar *) buf, buflen);
-      return my_datetime_binary_length(meta);
-    }
-
-  case MYSQL_TYPE_TIME:
-    {
-      my_snprintf(typestr, typestr_length, "TIME");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      uint32 i32= uint3korr(ptr);
-      my_b_printf(file, "'%02d:%02d:%02d'",
-                  i32 / 10000, (i32 % 10000) / 100, i32 % 100);
-      return 3;
-    }
-
-  case MYSQL_TYPE_TIME2:
-    {
-      my_snprintf(typestr, typestr_length, "TIME(%d)", meta);
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      char buf[MAX_DATE_STRING_REP_LENGTH];
-      MYSQL_TIME ltime;
-      longlong packed= my_time_packed_from_binary(ptr, meta);
-      TIME_from_longlong_time_packed(&ltime, packed);
-      int buflen= my_time_to_str(&ltime, buf, meta);
-      my_b_write_quoted(file, (uchar *) buf, buflen);
-      return my_time_binary_length(meta);
-    }
-
-  case MYSQL_TYPE_NEWDATE:
-    {
-      my_snprintf(typestr, typestr_length, "DATE");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      uint32 tmp= uint3korr(ptr);
-      int part;
-      char buf[11];
-      char *pos= &buf[10];  // start from '\0' to the beginning
-
-      /* Copied from field.cc */
-      *pos--=0;					// End NULL
-      part=(int) (tmp & 31);
-      *pos--= (char) ('0'+part%10);
-      *pos--= (char) ('0'+part/10);
-      *pos--= ':';
-      part=(int) (tmp >> 5 & 15);
-      *pos--= (char) ('0'+part%10);
-      *pos--= (char) ('0'+part/10);
-      *pos--= ':';
-      part=(int) (tmp >> 9);
-      *pos--= (char) ('0'+part%10); part/=10;
-      *pos--= (char) ('0'+part%10); part/=10;
-      *pos--= (char) ('0'+part%10); part/=10;
-      *pos=   (char) ('0'+part);
-      my_b_printf(file , "'%s'", buf);
-      return 3;
-    }
-
-  case MYSQL_TYPE_YEAR:
-    {
-      my_snprintf(typestr, typestr_length, "YEAR");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      uint32 i32= *ptr;
-      my_b_printf(file, "%04d", i32+ 1900);
-      return 1;
-    }
-  
-  case MYSQL_TYPE_ENUM:
-    switch (meta & 0xFF) {
-    case 1:
-      my_snprintf(typestr, typestr_length, "ENUM(1 byte)");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      my_b_printf(file, "%d", (int) *ptr);
-      return 1;
-    case 2:
-      {
-        my_snprintf(typestr, typestr_length, "ENUM(2 bytes)");
-        if(!ptr)
-          return my_b_printf(file, "NULL");
-        int32 i32= uint2korr(ptr);
-        my_b_printf(file, "%d", i32);
-        return 2;
-      }
-    default:
-      my_b_printf(file, "!! Unknown ENUM packlen=%d", meta & 0xFF); 
-      return 0;
-    }
-    break;
-    
-  case MYSQL_TYPE_SET:
-    my_snprintf(typestr, typestr_length, "SET(%d bytes)", meta & 0xFF);
-    if(!ptr)
-      return my_b_printf(file, "NULL");
-    my_b_write_bit(file, ptr , (meta & 0xFF) * 8);
-    return meta & 0xFF;
-  
-  case MYSQL_TYPE_BLOB:
-    switch (meta) {
-    case 1:
-      my_snprintf(typestr, typestr_length, "TINYBLOB/TINYTEXT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      length= *ptr;
-      my_b_write_quoted(file, ptr + 1, length);
-      return length + 1;
-    case 2:
-      my_snprintf(typestr, typestr_length, "BLOB/TEXT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      length= uint2korr(ptr);
-      my_b_write_quoted(file, ptr + 2, length);
-      return length + 2;
-    case 3:
-      my_snprintf(typestr, typestr_length, "MEDIUMBLOB/MEDIUMTEXT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      length= uint3korr(ptr);
-      my_b_write_quoted(file, ptr + 3, length);
-      return length + 3;
-    case 4:
-      my_snprintf(typestr, typestr_length, "LONGBLOB/LONGTEXT");
-      if(!ptr)
-        return my_b_printf(file, "NULL");
-      length= uint4korr(ptr);
-      my_b_write_quoted(file, ptr + 4, length);
-      return length + 4;
-    default:
-      my_b_printf(file, "!! Unknown BLOB packlen=%d", length);
-      return 0;
-    }
-
-  case MYSQL_TYPE_VARCHAR:
-  case MYSQL_TYPE_VAR_STRING:
-    length= meta;
-    my_snprintf(typestr, typestr_length, "VARSTRING(%d)", length);
-    if(!ptr) 
-      return my_b_printf(file, "NULL");
-    return my_b_write_quoted_with_length(file, ptr, length);
-
-  case MYSQL_TYPE_STRING:
-    my_snprintf(typestr, typestr_length, "STRING(%d)", length);
-    if(!ptr)
-      return my_b_printf(file, "NULL");
-    return my_b_write_quoted_with_length(file, ptr, length);
-
-  case MYSQL_TYPE_JSON:
-    my_snprintf(typestr, typestr_length, "JSON");
-    if (!ptr)
-      return my_b_printf(file, "NULL");
-    length= uint2korr(ptr);
-    my_b_write_quoted(file, ptr + meta, length);
-    return length + meta;
-
-  default:
-    {
-      char tmp[5];
-      my_snprintf(tmp, sizeof(tmp), "%04x", meta);
-      my_b_printf(file,
-                  "!! Don't know how to handle column type=%d meta=%d (%s)",
-                  type, meta, tmp);
-    }
-    break;
-  }
-  *typestr= 0;
-  return 0;
-}
-
-
-/**
-  Print a packed row into IO cache
-  
-  @param[in] file              IO cache
-  @param[in] td                Table definition
-  @param[in] print_event_into  Print parameters
-  @param[in] cols_bitmap       Column bitmaps.
-  @param[in] value             Pointer to packed row
-  @param[in] prefix            Row's SQL clause ("SET", "WHERE", etc)
-  
-  @retval   - number of bytes scanned.
-*/
-
-
-size_t
-Rows_log_event::print_verbose_one_row(IO_CACHE *file, table_def *td,
-                                      PRINT_EVENT_INFO *print_event_info,
-                                      MY_BITMAP *cols_bitmap,
-                                      const uchar *value, const uchar *prefix)
-{
-  const uchar *value0= value;
-  const uchar *null_bits= value;
-  uint null_bit_index= 0;
-  char typestr[64]= "";
-
-  /*
-    Skip metadata bytes which gives the information about nullabity of master
-    columns. Master writes one bit for each affected column.
-   */
-  value+= (bitmap_bits_set(cols_bitmap) + 7) / 8;
-  
-  my_b_printf(file, "%s", prefix);
-  
-  for (size_t i= 0; i < td->size(); i ++)
-  {
-    int is_null= (null_bits[null_bit_index / 8] 
-                  >> (null_bit_index % 8))  & 0x01;
-
-    if (bitmap_is_set(cols_bitmap, i) == 0)
-      continue;
-    
-    my_b_printf(file, "###   @%d=", static_cast<int>(i + 1));
-    if (!is_null)
-    {
-      size_t fsize= td->calc_field_size((uint)i, (uchar*) value);
-      if (value + fsize > m_rows_end)
-      {
-        my_b_printf(file, "***Corrupted replication event was detected."
-                    " Not printing the value***\n");
-        value+= fsize;
-        return 0;
-      }
-    }
-    size_t size= log_event_print_value(file,is_null? NULL: value,
-                                         td->type(i), td->field_metadata(i),
-                                         typestr, sizeof(typestr));
-    if (!size)
-      return 0;
-
-    if(!is_null)
-      value+= size;
-
-    if (print_event_info->verbose > 1)
-    {
-      my_b_printf(file, " /* ");
-
-      my_b_printf(file, "%s ", typestr);
-      
-      my_b_printf(file, "meta=%d nullable=%d is_null=%d ",
-                  td->field_metadata(i),
-                  td->maybe_null(i), is_null);
-      my_b_printf(file, "*/");
-    }
-    
-    my_b_printf(file, "\n");
-    
-    null_bit_index++;
-  }
-  return value - value0;
-}
-
-
-/**
-  Print a row event into IO cache in human readable form (in SQL format)
-  
-  @param[in] file              IO cache
-  @param[in] print_event_into  Print parameters
-*/
-void Rows_log_event::print_verbose(IO_CACHE *file,
-                                   PRINT_EVENT_INFO *print_event_info)
-{
-  // Quoted length of the identifier can be twice the original length
-  char quoted_db[1 + NAME_LEN * 2 + 2];
-  char quoted_table[1 + NAME_LEN * 2 + 2];
-  size_t quoted_db_len, quoted_table_len;
-  Table_map_log_event *map;
-  table_def *td;
-  const char *sql_command, *sql_clause1, *sql_clause2;
-  Log_event_type general_type_code= get_general_type_code();
-  
-  if (m_extra_row_data)
-  {
-    uint8 extra_data_len= m_extra_row_data[EXTRA_ROW_INFO_LEN_OFFSET];
-    uint8 extra_payload_len= extra_data_len - EXTRA_ROW_INFO_HDR_BYTES;
-    assert(extra_data_len >= EXTRA_ROW_INFO_HDR_BYTES);
-
-    my_b_printf(file, "### Extra row data format: %u, len: %u :",
-                m_extra_row_data[EXTRA_ROW_INFO_FORMAT_OFFSET],
-                extra_payload_len);
-    if (extra_payload_len)
-    {
-      /*
-         Buffer for hex view of string, including '0x' prefix,
-         2 hex chars / byte and trailing 0
-      */
-      const int buff_len= 2 + (256 * 2) + 1;
-      char buff[buff_len];
-      str_to_hex(buff, (const char*) &m_extra_row_data[EXTRA_ROW_INFO_HDR_BYTES],
-                 extra_payload_len);
-      my_b_printf(file, "%s", buff);
-    }
-    my_b_printf(file, "\n");
-  }
-
-  switch (general_type_code) {
-  case binary_log::WRITE_ROWS_EVENT:
-    sql_command= "INSERT INTO";
-    sql_clause1= "### SET\n";
-    sql_clause2= NULL;
-    break;
-  case binary_log::DELETE_ROWS_EVENT:
-    sql_command= "DELETE FROM";
-    sql_clause1= "### WHERE\n";
-    sql_clause2= NULL;
-    break;
-  case binary_log::UPDATE_ROWS_EVENT:
-    sql_command= "UPDATE";
-    sql_clause1= "### WHERE\n";
-    sql_clause2= "### SET\n";
-    break;
-  default:
-    sql_command= sql_clause1= sql_clause2= NULL;
-    DBUG_ASSERT(0); /* Not possible */
-  }
-  
-  if (!(map= print_event_info->m_table_map.get_table(m_table_id)) ||
-      !(td= map->create_table_def()))
-  {
-    char llbuff[22];
-    my_b_printf(file, "### Row event for unknown table #%s",
-                llstr(m_table_id, llbuff));
-    return;
-  }
-
-  /* If the write rows event contained no values for the AI */
-  if (((general_type_code == binary_log::WRITE_ROWS_EVENT) &&
-      (m_rows_buf==m_rows_end)))
-  {
-    my_b_printf(file, "### INSERT INTO `%s`.`%s` VALUES ()\n", 
-                      map->get_db_name(), map->get_table_name());
-    goto end;
-  }
-
-  for (const uchar *value= m_rows_buf; value < m_rows_end; )
-  {
-    size_t length;
-#ifdef MYSQL_SERVER
-    quoted_db_len= my_strmov_quoted_identifier(this->thd, (char *) quoted_db,
-                                        map->get_db_name(), 0);
-    quoted_table_len= my_strmov_quoted_identifier(this->thd,
-                                                  (char *) quoted_table,
-                                                  map->get_table_name(), 0);
-#else
-    quoted_db_len= my_strmov_quoted_identifier((char *) quoted_db,
-                                               map->get_db_name());
-    quoted_table_len= my_strmov_quoted_identifier((char *) quoted_table,
-                                          map->get_table_name());
-#endif
-    quoted_db[quoted_db_len]= '\0';
-    quoted_table[quoted_table_len]= '\0';
-    my_b_printf(file, "### %s %s.%s\n",
-                      sql_command,
-                      quoted_db, quoted_table);
-    /* Print the first image */
-    if (!(length= print_verbose_one_row(file, td, print_event_info,
-                                  &m_cols, value,
-                                  (const uchar*) sql_clause1)))
-      goto end;
-    value+= length;
-
-    /* Print the second image (for UPDATE only) */
-    if (sql_clause2)
-    {
-      if (!(length= print_verbose_one_row(file, td, print_event_info,
-                                      &m_cols_ai, value,
-                                      (const uchar*) sql_clause2)))
-        goto end;
-      value+= length;
-    }
-  }
-
-end:
-  delete td;
-}
 
 #ifdef MYSQL_CLIENT
 void free_table_map_log_event(Table_map_log_event *event)
@@ -5821,4 +6010,517 @@ Rows_query_log_event::write_data_body(IO_CACHE *file)
 void my_free(void *ptr)
 {
   free(ptr);
+}
+
+Table_map_log_event::Table_map_log_event(const char *buf, uint event_len,
+                                         const Format_description_event
+                                         *description_event)
+
+   : binary_log::Table_map_event(buf, event_len, description_event),
+     Log_event(header(), footer())
+{
+
+  if (m_null_bits != NULL && m_field_metadata != NULL && m_coltype != NULL)
+    is_valid_param= true;
+
+}
+
+Table_map_log_event::~Table_map_log_event()
+{
+  if(m_null_bits)
+  {
+    my_free(m_null_bits);
+    m_null_bits= NULL;
+  }
+  if(m_field_metadata)
+  {
+    my_free(m_field_metadata);
+    m_field_metadata= NULL;
+  }
+}
+
+void* my_multi_malloc( myf myFlags, ...)
+{
+  va_list args;
+  char **ptr,*start,*res;
+  size_t tot_length,length;
+
+
+  va_start(args,myFlags);
+  tot_length=0;
+  while ((ptr=va_arg(args, char **)))
+  {
+    length=va_arg(args,uint);
+    tot_length+=ALIGN_SIZE(length);
+  }
+  va_end(args);
+
+  if (!(start=(char *) malloc( tot_length)))
+    return(0); 
+
+  va_start(args,myFlags);
+  res=start;
+  while ((ptr=va_arg(args, char **)))
+  {
+    *ptr=res;
+    length=va_arg(args,uint);
+    res+=ALIGN_SIZE(length);
+  }
+  va_end(args);
+  return ((void*) start);
+}
+
+table_def::table_def(unsigned char *types, ulong size,
+                     uchar *field_metadata, int metadata_size,
+                     uchar *null_bitmap, uint16 flags)
+  : m_size(size), m_type(0), m_field_metadata_size(metadata_size),
+    m_field_metadata(0), m_null_bits(0), m_flags(flags),
+    m_memory(NULL)
+{
+  m_memory= (uchar *)my_multi_malloc(16,
+                                     &m_type, size,
+                                     &m_field_metadata,
+                                     size * sizeof(uint16),
+                                     &m_null_bits, (size + 7) / 8,
+                                     NULL);
+
+  memset(m_field_metadata, 0, size * sizeof(uint16));
+
+  if (m_type)
+    memcpy(m_type, types, size);
+  else
+    m_size= 0;
+  /*
+    Extract the data from the table map into the field metadata array
+    iff there is field metadata. The variable metadata_size will be
+    0 if we are replicating from an older version server since no field
+    metadata was written to the table map. This can also happen if 
+    there were no fields in the master that needed extra metadata.
+  */
+  if (m_size && metadata_size)
+  { 
+    int index= 0;
+    for (unsigned int i= 0; i < m_size; i++)
+    {
+      switch (binlog_type(i)) {
+      case MYSQL_TYPE_TINY_BLOB_B:
+      case MYSQL_TYPE_BLOB_B:
+      case MYSQL_TYPE_MEDIUM_BLOB_B:
+      case MYSQL_TYPE_LONG_BLOB_B:
+      case MYSQL_TYPE_DOUBLE_B:
+      case MYSQL_TYPE_FLOAT_B:
+      case MYSQL_TYPE_GEOMETRY_B:
+      case MYSQL_TYPE_JSON_B:
+      {
+        /*
+          These types store a single byte.
+        */
+        m_field_metadata[i]= field_metadata[index];
+        index++;
+        break;
+      }
+      case MYSQL_TYPE_SET_B:
+      case MYSQL_TYPE_ENUM_B:
+      case MYSQL_TYPE_STRING_B:
+      {
+        uint16 x= field_metadata[index++] << 8U; // real_type
+        x+= field_metadata[index++];            // pack or field length
+        m_field_metadata[i]= x;
+        break;
+      }
+      case MYSQL_TYPE_BIT_B:
+      {
+        uint16 x= field_metadata[index++];
+        x = x + (field_metadata[index++] << 8U);
+        m_field_metadata[i]= x;
+        break;
+      }
+      case MYSQL_TYPE_VARCHAR_B:
+      {
+        /*
+          These types store two bytes.
+        */
+        char *ptr= (char *)&field_metadata[index];
+        m_field_metadata[i]= uint2korr(ptr);
+        index= index + 2;
+        break;
+      }
+      case MYSQL_TYPE_NEWDECIMAL_B:
+      {
+        uint16 x= field_metadata[index++] << 8U; // precision
+        x+= field_metadata[index++];            // decimals
+        m_field_metadata[i]= x;
+        break;
+      }
+      case MYSQL_TYPE_TIME2_B:
+      case MYSQL_TYPE_DATETIME2_B:
+      case MYSQL_TYPE_TIMESTAMP2_B:
+        m_field_metadata[i]= field_metadata[index++];
+        break;
+      default:
+        m_field_metadata[i]= 0;
+        break;
+      }
+    }
+  }
+  if (m_size && null_bitmap)
+    memcpy(m_null_bits, null_bitmap, (m_size + 7) / 8);
+}
+
+int decimal_binary_size(int precision, int scale)
+ {
+   static const int dig2bytes[10]= {0, 1, 1, 2, 2, 3, 3, 4, 4, 4};
+   int intg= precision-scale,
+       intg0= intg/9, frac0= scale/9,
+       intg0x= intg-intg0*9, frac0x= scale-frac0*9;
+
+   return intg0 * sizeof(uint32_t) + dig2bytes[intg0x]+
+          frac0 * sizeof(uint32_t) + dig2bytes[frac0x];
+ }
+
+unsigned int my_time_binary_length(unsigned int dec)
+{
+  return 3 + (dec + 1) / 2;
+}
+
+static unsigned int uint_max(int bits) {
+  return (((1U << (bits - 1)) - 1) << 1) | 1;
+}
+/**
+   Compute the maximum display length of a field.
+
+   @param sql_type Type of the field
+   @param metadata The metadata from the master for the field.
+   @return Maximum length of the field in bytes.
+ */
+unsigned int
+max_display_length_for_field(enum_field_types_b sql_type, unsigned int metadata)
+{
+  switch (sql_type) {
+  case MYSQL_TYPE_NEWDECIMAL_B:
+    return metadata >> 8;
+
+  case MYSQL_TYPE_FLOAT_B:
+    return 12;
+
+  case MYSQL_TYPE_DOUBLE_B:
+    return 22;
+
+  case MYSQL_TYPE_SET_B:
+  case MYSQL_TYPE_ENUM_B:
+      return metadata & 0x00ff;
+
+  case MYSQL_TYPE_STRING_B:
+  {
+    unsigned char type= metadata >> 8;
+    if (type == MYSQL_TYPE_SET_B || type == MYSQL_TYPE_ENUM_B)
+      return metadata & 0xff;
+    else
+      return (((metadata >> 4) & 0x300) ^ 0x300) + (metadata & 0x00ff);
+  }
+
+  case MYSQL_TYPE_YEAR_B:
+  case MYSQL_TYPE_TINY_B:
+    return 4;
+
+  case MYSQL_TYPE_SHORT_B:
+    return 6;
+
+  case MYSQL_TYPE_INT24_B:
+    return 9;
+
+  case MYSQL_TYPE_LONG_B:
+    return 11;
+
+  case MYSQL_TYPE_LONGLONG_B:
+    return 20;
+
+  case MYSQL_TYPE_NULL_B:
+    return 0;
+
+  case MYSQL_TYPE_NEWDATE_B:
+    return 3;
+
+  case MYSQL_TYPE_DATE_B:
+  case MYSQL_TYPE_TIME_B:
+  case MYSQL_TYPE_TIME2_B:
+    return 3;
+
+  case MYSQL_TYPE_TIMESTAMP_B:
+  case MYSQL_TYPE_TIMESTAMP2_B:
+    return 4;
+
+  case MYSQL_TYPE_DATETIME_B:
+  case MYSQL_TYPE_DATETIME2_B:
+    return 8;
+
+  case MYSQL_TYPE_BIT_B:
+    /*
+      Decode the size of the bit field from the master.
+    */
+  
+    return 8 * (metadata >> 8U) + (metadata & 0x00ff);
+
+  case MYSQL_TYPE_VAR_STRING_B:
+  case MYSQL_TYPE_VARCHAR_B:
+    return metadata;
+
+    /*
+      The actual length for these types does not really matter since
+      they are used to calc_pack_length, which ignores the given
+      length for these types.
+
+      Since we want this to be accurate for other uses, we return the
+      maximum size in bytes of these BLOBs.
+    */
+
+  case MYSQL_TYPE_TINY_BLOB_B:
+    return uint_max(1 * 8);
+
+  case MYSQL_TYPE_MEDIUM_BLOB_B:
+    return uint_max(3 * 8);
+
+  case MYSQL_TYPE_BLOB_B:
+    /*
+      For the blob type, Field::real_type() lies and say that all
+      blobs are of type MYSQL_TYPE_BLOB. In that case, we have to look
+      at the length instead to decide what the max display size is.
+     */
+    return uint_max(metadata * 8);
+
+  case MYSQL_TYPE_LONG_BLOB_B:
+  case MYSQL_TYPE_GEOMETRY_B:
+  case MYSQL_TYPE_JSON_B:
+    return uint_max(4 * 8);
+
+  default:
+    return UINT_MAX;
+  }
+}
+uint32_t inline le32toh(uint32_t x)
+{
+    /*
+    return (((x >> 24) & 0xff) |
+            ((x <<  8) & 0xff0000) |
+            ((x >>  8) & 0xff00) |
+            ((x << 24) & 0xff000000));
+    */        
+   return x;
+}
+
+unsigned int my_timestamp_binary_length(unsigned int dec)
+{
+  return 4 + (dec + 1) / 2;
+}
+
+unsigned int my_datetime_binary_length(unsigned int dec)
+{
+  return 5 + (dec + 1) / 2;
+}
+
+
+/**
+ This helper function calculates the size in bytes of a particular field in a
+ row type event as defined by the field_ptr and metadata_ptr arguments.
+ @param col Field type code
+ @param master_data The field data
+ @param metadata The field metadata
+
+ @return The size in bytes of a particular field
+*/
+uint32_t calc_field_size(unsigned char col, const unsigned char *master_data,
+                         unsigned int metadata)
+{
+  uint32_t length= 0;
+
+  switch ((col)) {
+  case MYSQL_TYPE_NEWDECIMAL_B:
+    length= decimal_binary_size(metadata >> 8,
+                                metadata & 0xff);
+    break;
+  case MYSQL_TYPE_DECIMAL_B:
+  case MYSQL_TYPE_FLOAT_B:
+  case MYSQL_TYPE_DOUBLE_B:
+    length= metadata;
+    break;
+  /*
+    The cases for SET and ENUM are include for completeness, however
+    both are mapped to type MYSQL_TYPE_STRING and their real types
+    are encoded in the field metadata.
+  */
+  case MYSQL_TYPE_SET_B:
+  case MYSQL_TYPE_ENUM_B:
+  case MYSQL_TYPE_STRING_B:
+  {
+    unsigned char type= metadata >> 8U;
+    if ((type == MYSQL_TYPE_SET_B) || (type == MYSQL_TYPE_ENUM_B))
+      length= metadata & 0x00ff;
+    else
+    {
+      /*
+        We are reading the actual size from the master_data record
+        because this field has the actual lengh stored in the first
+        one or two bytes.
+      */
+      length= max_display_length_for_field(MYSQL_TYPE_STRING_B, metadata) > 255 ? 2 : 1;
+
+      if (length == 1)
+        length+= *master_data;
+      else
+      {
+        uint32_t temp= 0;
+        memcpy(&temp, master_data, 2);
+        length= length + le32toh(temp);
+      }
+    }
+    break;
+  }
+  case MYSQL_TYPE_YEAR_B:
+  case MYSQL_TYPE_TINY_B:
+    length= 1;
+    break;
+  case MYSQL_TYPE_SHORT_B:
+    length= 2;
+    break;
+  case MYSQL_TYPE_INT24_B:
+    length= 3;
+    break;
+  case MYSQL_TYPE_LONG_B:
+    length= 4;
+    break;
+  case MYSQL_TYPE_LONGLONG_B:
+    length= 8;
+    break;
+  case MYSQL_TYPE_NULL_B:
+    length= 0;
+    break;
+  case MYSQL_TYPE_NEWDATE_B:
+    length= 3;
+    break;
+  case MYSQL_TYPE_DATE_B:
+  case MYSQL_TYPE_TIME_B:
+    length= 3;
+    break;
+  case MYSQL_TYPE_TIME2_B:
+    /*
+      The original methods in the server to calculate the binary size of the
+      packed numeric time representation is defined in my_time.c, the signature
+      being  unsigned int my_time_binary_length(uint)
+
+      The length below needs to be updated if the above method is updated in
+      the server
+    */
+    length= my_time_binary_length(metadata);
+    break;
+  case MYSQL_TYPE_TIMESTAMP_B:
+    length= 4;
+    break;
+  case MYSQL_TYPE_TIMESTAMP2_B:
+    /*
+      The original methods in the server to calculate the binary size of the
+      packed numeric time representation is defined in time.c, the signature
+      being  unsigned int my_timestamp_binary_length(uint)
+
+      The length below needs to be updated if the above method is updated in
+      the server
+    */
+    length= my_timestamp_binary_length(metadata);
+    break;
+  case MYSQL_TYPE_DATETIME_B:
+    length= 8;
+    break;
+  case MYSQL_TYPE_DATETIME2_B:
+    /*
+      The original methods in the server to calculate the binary size of the
+      packed numeric time representation is defined in time.c, the signature
+      being  unsigned int my_datetime_binary_length(uint)
+
+      The length below needs to be updated if the above method is updated in
+      the server
+    */
+    length= my_datetime_binary_length(metadata);
+    break;
+  case MYSQL_TYPE_BIT_B:
+  {
+    /*
+      Decode the size of the bit field from the master.
+        from_len is the length in bytes from the master
+        from_bit_len is the number of extra bits stored in the master record
+      If from_bit_len is not 0, add 1 to the length to account for accurate
+      number of bytes needed.
+    */
+    unsigned int from_len= (metadata >> 8U) & 0x00ff;
+    unsigned int from_bit_len= metadata & 0x00ff;
+
+    length= from_len + ((from_bit_len > 0) ? 1 : 0);
+    break;
+  }
+  case MYSQL_TYPE_VARCHAR_B:
+  {
+    length= metadata > 255 ? 2 : 1;
+    if (length == 1)
+      length+= (uint32_t) *master_data;
+    else
+    {
+      uint32_t temp= 0;
+      memcpy(&temp, master_data, 2);
+      length= length + le32toh(temp);
+    }
+    break;
+  }
+  case MYSQL_TYPE_TINY_BLOB_B:
+  case MYSQL_TYPE_MEDIUM_BLOB_B:
+  case MYSQL_TYPE_LONG_BLOB_B:
+  case MYSQL_TYPE_BLOB_B:
+  case MYSQL_TYPE_GEOMETRY_B:
+  case MYSQL_TYPE_JSON_B:
+  {
+    /*
+      Compute the length of the data. We cannot use get_length() here
+      since it is dependent on the specific table (and also checks the
+      packlength using the internal 'table' pointer) and replication
+      is using a fixed format for storing data in the binlog.
+    */
+    switch (metadata) {
+    case 1:
+      length= *master_data;
+      break;
+    case 2:
+      memcpy(&length, master_data, 2);
+      length= le32toh(length);
+      break;
+    case 3:
+      memcpy(&length, master_data, 3);
+      length= le32toh(length);
+      break;
+    case 4:
+      memcpy(&length, master_data, 4);
+      length= le32toh(length);
+      break;
+    default:
+      break;
+    }
+
+    length+= metadata;
+    break;
+  }
+  default:
+    length= UINT_MAX;
+  }
+  return length;
+}
+uint32 table_def::calc_field_size(uint col, uchar *master_data) const
+{
+  uint32 length= ::calc_field_size(type(col), master_data,
+                                   m_field_metadata[col]);
+  return length;
+}
+
+table_def::~table_def()
+{
+  my_free(m_memory);
+#ifndef DBUG_OFF
+  m_type= 0;
+  m_size= 0;
+#endif
 }

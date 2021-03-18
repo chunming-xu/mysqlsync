@@ -48,7 +48,7 @@ typedef struct st_mysql_time
 {
   unsigned int  year, month, day, hour, minute, second;
   unsigned long second_part;  /**< microseconds */
-  my_bool       neg;
+  bool       neg;
   enum enum_mysql_timestamp_type time_type;
 } MYSQL_TIME;
 

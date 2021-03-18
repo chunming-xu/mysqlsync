@@ -11,6 +11,7 @@
 #include "statement_events.h"
 #include "rows_event.h"
 #include "typelib.h"
+#include "mysql_time.h"
 
 typedef unsigned long long int ulonglong; /* ulong or unsigned long long */
 typedef long long int	longlong;
@@ -18,6 +19,7 @@ typedef longlong int64;
 typedef ulonglong uint64;
 typedef unsigned long	ulong;
 
+#define MAX_DATE_STRING_REP_LENGTH 30
 #define MAX_DBS_IN_EVENT_MTS 16
 #define	ULLONG_MAX	0xffffffffffffffffULL	/* max unsigned long long */
 #define	LLONG_MAX	0x7fffffffffffffffLL	/* max signed long long */
@@ -81,7 +83,26 @@ class Format_description_log_event;
 typedef bool (*read_log_event_filter_function)(char** buf,
                                                ulong*,
                                                const Format_description_log_event*);
-
+#define mi_sint2korr(A) ((int16) (((int16) (((uchar*) (A))[1])) +\
+                                  ((int16) ((int16) ((char*) (A))[0]) << 8)))
+#define mi_sint3korr(A) ((int32) (((((uchar*) (A))[0]) & 128) ? \
+                                  (((uint32) 255L << 24) | \
+                                   (((uint32) ((uchar*) (A))[0]) << 16) |\
+                                   (((uint32) ((uchar*) (A))[1]) << 8) | \
+                                   ((uint32) ((uchar*) (A))[2])) : \
+                                  (((uint32) ((uchar*) (A))[0]) << 16) |\
+                                  (((uint32) ((uchar*) (A))[1]) << 8) | \
+                                  ((uint32) ((uchar*) (A))[2])))                                               
+#define mi_uint4korr(A) ((uint32) (((uint32) (((uchar*) (A))[3])) +\
+                                   (((uint32) (((uchar*) (A))[2])) << 8) +\
+                                   (((uint32) (((uchar*) (A))[1])) << 16) +\
+                                   (((uint32) (((uchar*) (A))[0])) << 24)))
+#define mi_uint5korr(A) ((ulonglong)(((uint32) (((uchar*) (A))[4])) +\
+                                    (((uint32) (((uchar*) (A))[3])) << 8) +\
+                                    (((uint32) (((uchar*) (A))[2])) << 16) +\
+                                    (((uint32) (((uchar*) (A))[1])) << 24)) +\
+                                    (((ulonglong) (((uchar*) (A))[0])) << 32))
+#define DATETIME_MAX_DECIMALS 6
 inline uint16 uint2korr(const uchar *A) { return *((uint16*) A); }
 
 inline uint16    uint2korr(const char *pT)
@@ -98,8 +119,28 @@ using binary_log::Log_event_footer;
 using binary_log::Binary_log_event;
 using binary_log::Format_description_event;
 
+#define MY_PACKED_TIME_GET_FRAC_PART(x)    ((x) % (1LL << 24))
+#define MY_PACKED_TIME_GET_INT_PART(x)     ((x) >> 24)
+
+typedef long long int	longlong;
+
 typedef uint32 my_bitmap_map;
 
+/*
+enum enum_mysql_timestamp_type
+{
+  MYSQL_TIMESTAMP_NONE= -2, MYSQL_TIMESTAMP_ERROR= -1,
+  MYSQL_TIMESTAMP_DATE= 0, MYSQL_TIMESTAMP_DATETIME= 1, MYSQL_TIMESTAMP_TIME= 2
+};
+
+typedef struct st_mysql_time
+{
+  unsigned int  year, month, day, hour, minute, second;
+  unsigned long second_part;  
+  my_bool       neg;
+  enum enum_mysql_timestamp_type time_type;
+} MYSQL_TIME;
+*/
 typedef struct st_bitmap
 {
   my_bitmap_map *bitmap;

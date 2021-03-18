@@ -24,6 +24,8 @@ using std::max;
 //char _dig_vec_upper[64];
 char _dig_vec_upper[] =
   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+#define MY_PACKED_TIME_MAKE_INT(i)         ((((longlong) (i)) << 24))
+#define MY_PACKED_TIME_MAKE(i, f)          ((((longlong) (i)) << 24) + (f))
 
 #define my_b_write(info,Buffer,Count) \
  ((info)->write_pos + (Count) <=(info)->write_end ?\
@@ -74,7 +76,15 @@ TYPELIB binlog_checksum_typelib=
   binlog_checksum_type_length
 };*/
 
+unsigned int my_timestamp_binary_length(unsigned int dec)
+{
+  return 4 + (dec + 1) / 2;
+}
 
+unsigned int my_datetime_binary_length(unsigned int dec)
+{
+  return 5 + (dec + 1) / 2;
+}
 #define log_cs	&my_charset_latin1
 
 /*
@@ -84,6 +94,7 @@ TYPELIB binlog_checksum_typelib=
   exponent digits + '\0'
 */
 #define FMT_G_BUFSIZE(PREC) (3 + (PREC) + 5 + 1)
+#define DATETIMEF_INT_OFS 0x8000000000LL
 
 #if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
 static int rows_event_stmt_cleanup(Relay_log_info const *rli, THD* thd);
@@ -1738,6 +1749,52 @@ my_b_write_bit(const uchar *ptr, uint nbits)
   }
   printf("'");
 }
+void my_timestamp_from_binary(struct timeval *tm, const uchar *ptr, uint dec)
+{
+
+  tm->tv_sec= mi_uint4korr(ptr);
+  switch (dec)
+  {
+    case 0:
+    default:
+      tm->tv_usec= 0;
+      break;
+    case 1:
+    case 2:
+      tm->tv_usec= ((int) ptr[4]) * 10000;
+      break;
+    case 3:
+    case 4:
+      tm->tv_usec= mi_sint2korr(ptr + 4) * 100;
+      break;
+    case 5:
+    case 6:
+      tm->tv_usec= mi_sint3korr(ptr + 4);
+  }
+}
+static inline int
+my_useconds_to_str(char *to, ulong useconds, uint dec)
+{
+  ulonglong _log_10_int[20]=
+{
+  1, 10, 100, 1000, 10000UL, 100000UL, 1000000UL, 10000000UL,
+  100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
+  1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+  1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+  1000000000000000000ULL, 10000000000000000000ULL
+};
+
+  return sprintf(to, ".%0*lu", (int) dec,
+                 useconds / (ulong) _log_10_int[DATETIME_MAX_DECIMALS - dec]);
+}
+
+int my_timeval_to_str(const struct timeval *tm, char *to, uint dec)
+{
+  int len= sprintf(to, "%d", (int) tm->tv_sec);
+  if (dec)
+    len+= my_useconds_to_str(to + len, tm->tv_usec, dec);
+  return len;
+}
 
 static void
 my_b_write_quoted(IO_CACHE *file, const uchar *ptr, uint length)
@@ -1747,7 +1804,11 @@ my_b_write_quoted(IO_CACHE *file, const uchar *ptr, uint length)
   for (s= ptr; length > 0 ; s++, length--)
   {
     if (*s > 0x1F && *s != '\'' && *s != '\\')
-      ;//my_b_write(file, s, 1);
+    {
+       uchar str = *s;
+       printf("%c", str);
+    }
+      //my_b_write(file, s, 1);
     else
     {
       uchar hex[10];
@@ -1774,6 +1835,118 @@ my_b_write_quoted_with_length(IO_CACHE *file, const uchar *ptr, uint length)
     return length + 2;
   }
 }
+
+longlong my_datetime_packed_from_binary(const uchar *ptr, uint dec)
+{
+  longlong intpart= mi_uint5korr(ptr) - DATETIMEF_INT_OFS;
+  int frac;
+ 
+  switch (dec)
+  {
+  case 0:
+  default:
+    return MY_PACKED_TIME_MAKE_INT(intpart);
+  case 1:
+  case 2:
+    frac= ((int) (signed char) ptr[5]) * 10000;
+    break;
+  case 3:
+  case 4:
+    frac= mi_sint2korr(ptr + 5) * 100;
+    break;
+  case 5:
+  case 6:
+    frac= mi_sint3korr(ptr + 5);
+    break;
+  }
+  return MY_PACKED_TIME_MAKE(intpart, frac);
+}
+
+
+
+void TIME_from_longlong_datetime_packed(MYSQL_TIME *ltime, longlong tmp)
+{
+  longlong ymd, hms;
+  longlong ymdhms, ym;
+  if ((ltime->neg= (tmp < 0)))
+    tmp= -tmp;
+
+  ltime->second_part= MY_PACKED_TIME_GET_FRAC_PART(tmp);
+  ymdhms= MY_PACKED_TIME_GET_INT_PART(tmp);
+
+  ymd= ymdhms >> 17;
+  ym= ymd >> 5;
+  hms= ymdhms % (1 << 17);
+
+  ltime->day= ymd % (1 << 5);
+  ltime->month= ym % 13;
+  ltime->year= (uint)(ym / 13);
+
+  ltime->second= hms % (1 << 6);
+  ltime->minute= (hms >> 6) % (1 << 6);
+  ltime->hour= (uint)(hms >> 12);
+  
+  ltime->time_type= MYSQL_TIMESTAMP_DATETIME;
+}
+static inline int
+TIME_to_datetime_str(char *to, const MYSQL_TIME *ltime)
+{
+  uint32 temp, temp2;
+  /* Year */
+  temp= ltime->year / 100;
+  *to++= (char) ('0' + temp / 10);
+  *to++= (char) ('0' + temp % 10);
+  temp= ltime->year % 100;
+  *to++= (char) ('0' + temp / 10);
+  *to++= (char) ('0' + temp % 10);
+  *to++= '-';
+  /* Month */
+  temp= ltime->month;
+  temp2= temp / 10;
+  temp= temp-temp2 * 10;
+  *to++= (char) ('0' + (char) (temp2));
+  *to++= (char) ('0' + (char) (temp));
+  *to++= '-';
+  /* Day */ 
+  temp= ltime->day;
+  temp2= temp / 10;
+  temp= temp - temp2 * 10;
+  *to++= (char) ('0' + (char) (temp2));
+  *to++= (char) ('0' + (char) (temp));
+  *to++= ' ';
+  /* Hour */
+  temp= ltime->hour;
+  temp2= temp / 10;
+  temp= temp - temp2 * 10;
+  *to++= (char) ('0' + (char) (temp2));
+  *to++= (char) ('0' + (char) (temp));
+  *to++= ':';
+  /* Minute */
+  temp= ltime->minute;
+  temp2= temp / 10;
+  temp= temp - temp2 * 10;
+  *to++= (char) ('0' + (char) (temp2));
+  *to++= (char) ('0' + (char) (temp));
+  *to++= ':';
+  /* Second */
+  temp= ltime->second;
+  temp2=temp / 10;
+  temp= temp - temp2 * 10;
+  *to++= (char) ('0' + (char) (temp2));
+  *to++= (char) ('0' + (char) (temp));
+  return 19;
+}
+
+int my_datetime_to_str(const MYSQL_TIME *l_time, char *to, uint dec)
+{
+  int len= TIME_to_datetime_str(to, l_time);
+  if (dec)
+    len+= my_useconds_to_str(to + len, l_time->second_part, dec);
+  else
+    to[len]= '\0';
+  return len;
+}
+
 /**
   Print a packed value of the given SQL type into IO cache
   
@@ -1947,7 +2120,7 @@ log_event_print_value( const uchar *ptr,
       return 4;
     }
 
- /*
+ 
   case MYSQL_TYPE_TIMESTAMP2_B:
     {
       snprintf(typestr, typestr_length, "TIMESTAMP(%d)", meta);
@@ -1957,10 +2130,11 @@ log_event_print_value( const uchar *ptr,
       struct timeval tm;
       my_timestamp_from_binary(&tm, ptr, meta);
       int buflen= my_timeval_to_str(&tm, buf, meta);
-      my_b_write(file, buf, buflen);
+      //my_b_write(file, buf, buflen);
+      printf("%s\n", buf);
       return my_timestamp_binary_length(meta);
     }
-    */
+    
 
   case MYSQL_TYPE_DATETIME_B:
     {
@@ -1981,21 +2155,21 @@ log_event_print_value( const uchar *ptr,
       return 8;
     }
   
-  /*
+  
   case MYSQL_TYPE_DATETIME2_B:
     {
-      my_snprintf(typestr, typestr_length, "DATETIME(%d)", meta);
+      snprintf(typestr, typestr_length, "DATETIME(%d)", meta);
       if(!ptr)
-        return my_b_printf(file, "NULL");
+        return printf("NULL");
       char buf[MAX_DATE_STRING_REP_LENGTH];
-      MYSQL_TIME ltime;
+      st_mysql_time ltime;
       longlong packed= my_datetime_packed_from_binary(ptr, meta);
       TIME_from_longlong_datetime_packed(&ltime, packed);
       int buflen= my_datetime_to_str(&ltime, buf, meta);
-      my_b_write_quoted(file, (uchar *) buf, buflen);
+      my_b_write_quoted(NULL, (uchar *) buf, buflen);
       return my_datetime_binary_length(meta);
     }
-    */
+    
 
   case MYSQL_TYPE_TIME_B:
     {
@@ -6308,15 +6482,7 @@ uint32_t inline le32toh(uint32_t x)
    return x;
 }
 
-unsigned int my_timestamp_binary_length(unsigned int dec)
-{
-  return 4 + (dec + 1) / 2;
-}
 
-unsigned int my_datetime_binary_length(unsigned int dec)
-{
-  return 5 + (dec + 1) / 2;
-}
 
 
 /**
